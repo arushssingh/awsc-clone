@@ -15,6 +15,8 @@ import CloudWatch from './pages/CloudWatch';
 import VPC from './pages/VPC';
 import VPCDetail from './pages/VPCDetail';
 import IAM from './pages/IAM';
+import Deploy from './pages/Deploy';
+import DeployDetail from './pages/DeployDetail';
 
 export default function App() {
   return (
@@ -36,6 +38,8 @@ export default function App() {
             <Route path="/vpc" element={<VPC />} />
             <Route path="/vpc/:id" element={<VPCDetail />} />
             <Route path="/iam" element={<IAM />} />
+            <Route path="/deploy" element={<Deploy />} />
+            <Route path="/deploy/:id" element={<DeployDetail />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

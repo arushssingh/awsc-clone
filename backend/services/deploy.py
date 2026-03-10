@@ -1,0 +1,584 @@
+import asyncio
+import io
+import json
+import os
+import re
+import shutil
+import tarfile
+import threading
+import zipfile
+from pathlib import Path
+from typing import Optional
+
+import docker
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from auth import require_permission
+from config import SERVER_PUBLIC_IP
+from database import Deployment, User, get_db, generate_id, async_session
+
+router = APIRouter(prefix="/api/v1/deploy", tags=["deploy"])
+
+DEPLOYS_DIR = Path("/app/data/deploys")
+DEPLOYS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Port counter for deployments (separate range from EC2)
+_port_lock = threading.Lock()
+_next_deploy_port = 40000
+
+
+def _allocate_port() -> int:
+    global _next_deploy_port
+    with _port_lock:
+        port = _next_deploy_port
+        _next_deploy_port += 1
+        if _next_deploy_port > 41000:
+            _next_deploy_port = 40000
+        return port
+
+
+def _get_docker():
+    return docker.from_env()
+
+
+# ── Project detection ──────────────────────────────────────────────────
+
+def _detect_project(project_dir: Path) -> dict:
+    """Analyze project files and return type info."""
+
+    if (project_dir / "Dockerfile").exists():
+        return {"type": "dockerfile", "label": "Custom Dockerfile"}
+
+    pkg_file = project_dir / "package.json"
+    if pkg_file.exists():
+        try:
+            pkg = json.loads(pkg_file.read_text())
+        except json.JSONDecodeError:
+            pkg = {}
+
+        deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+        scripts = pkg.get("scripts", {})
+
+        if "next" in deps:
+            return {"type": "nextjs", "label": "Next.js", "port": 3000}
+
+        if "build" in scripts:
+            if "vite" in deps or (project_dir / "vite.config.js").exists() or (project_dir / "vite.config.ts").exists():
+                return {"type": "vite", "label": "Vite", "output": "dist"}
+            if "react-scripts" in deps:
+                return {"type": "cra", "label": "React (CRA)", "output": "build"}
+            if "@angular/core" in deps:
+                return {"type": "angular", "label": "Angular", "output": "dist"}
+            if "svelte" in deps or "@sveltejs/kit" in deps:
+                return {"type": "svelte", "label": "Svelte", "output": "build"}
+            if "@vue/cli-service" in deps or "vue" in deps:
+                return {"type": "vue", "label": "Vue", "output": "dist"}
+            return {"type": "node-static", "label": "Node.js (static)", "output": "dist"}
+
+        if "start" in scripts or "main" in pkg:
+            return {"type": "node-server", "label": "Node.js Server", "port": 3000}
+
+    if (project_dir / "requirements.txt").exists():
+        reqs = (project_dir / "requirements.txt").read_text().lower()
+        if "fastapi" in reqs or "uvicorn" in reqs:
+            return {"type": "python", "label": "Python (FastAPI)", "port": 8000}
+        if "flask" in reqs:
+            return {"type": "python", "label": "Python (Flask)", "port": 5000}
+        if "django" in reqs:
+            return {"type": "python", "label": "Python (Django)", "port": 8000}
+        return {"type": "python", "label": "Python", "port": 8000}
+
+    if any((project_dir / f).exists() for f in ["index.html", "index.htm"]):
+        return {"type": "static", "label": "Static HTML"}
+
+    return {"type": "unknown", "label": "Unknown"}
+
+
+# ── Dockerfile generation ──────────────────────────────────────────────
+
+def _generate_dockerfile(info: dict, project_dir: Path) -> Optional[str]:
+    t = info["type"]
+
+    if t == "dockerfile":
+        return None  # use existing
+
+    if t == "static":
+        return "FROM nginx:alpine\nCOPY . /usr/share/nginx/html\nEXPOSE 80"
+
+    if t in ("vite", "cra", "vue", "angular", "svelte", "node-static"):
+        out = info.get("output", "dist")
+        return f"""FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=builder /app/{out} /usr/share/nginx/html
+EXPOSE 80"""
+
+    if t == "nextjs":
+        return """FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+EXPOSE 3000
+CMD ["npm", "start"]"""
+
+    if t == "node-server":
+        return """FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install --production
+COPY . .
+EXPOSE 3000
+CMD ["npm", "start"]"""
+
+    if t == "python":
+        entry = "app.py"
+        for f in ["main.py", "app.py", "server.py", "run.py", "manage.py"]:
+            if (project_dir / f).exists():
+                entry = f
+                break
+
+        reqs = ""
+        if (project_dir / "requirements.txt").exists():
+            reqs = (project_dir / "requirements.txt").read_text().lower()
+
+        port = info.get("port", 8000)
+        if "fastapi" in reqs or "uvicorn" in reqs:
+            module = entry[:-3]
+            cmd = f'CMD ["uvicorn", "{module}:app", "--host", "0.0.0.0", "--port", "{port}"]'
+        elif "django" in reqs:
+            cmd = f'CMD ["python", "manage.py", "runserver", "0.0.0.0:{port}"]'
+        else:
+            cmd = f'CMD ["python", "{entry}"]'
+
+        return f"""FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE {port}
+{cmd}"""
+
+    return None
+
+
+# ── Background build worker ───────────────────────────────────────────
+
+_build_semaphore = asyncio.Semaphore(1)  # 1 build at a time (4GB RAM)
+
+
+async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
+    """Build Docker image and start container. Runs in background."""
+    log_lines = []
+
+    def log(msg: str):
+        log_lines.append(msg)
+
+    async def _save_status(status: str):
+        async with async_session() as db:
+            result = await db.execute(select(Deployment).where(Deployment.id == deploy_id))
+            dep = result.scalar_one_or_none()
+            if dep:
+                dep.status = status
+                dep.build_log = "\n".join(log_lines)
+                dep.project_type = info["type"]
+                dep.project_label = info["label"]
+                await db.commit()
+
+    async with _build_semaphore:
+        try:
+            await _save_status("building")
+            log(f"[detect] Project type: {info['label']} ({info['type']})")
+
+            # Generate Dockerfile if needed
+            dockerfile_content = _generate_dockerfile(info, project_dir)
+            if dockerfile_content is not None:
+                (project_dir / "Dockerfile").write_text(dockerfile_content)
+                log("[build] Generated Dockerfile")
+            else:
+                log("[build] Using existing Dockerfile")
+
+            # Determine container port
+            is_static = info["type"] in ("static", "vite", "cra", "vue", "angular", "svelte", "node-static")
+            container_port = 80 if is_static else info.get("port", 3000)
+
+            image_tag = f"awsclone-deploy-{deploy_id}"
+            log(f"[build] Building image: {image_tag} ...")
+
+            # Build image in thread (blocking Docker SDK call)
+            def _docker_build():
+                client = _get_docker()
+                image, build_logs = client.images.build(
+                    path=str(project_dir),
+                    tag=image_tag,
+                    rm=True,
+                    forcerm=True,
+                )
+                return image, build_logs
+
+            try:
+                image, build_logs = await asyncio.to_thread(_docker_build)
+                for chunk in build_logs:
+                    if "stream" in chunk:
+                        line = chunk["stream"].strip()
+                        if line:
+                            log(f"  {line}")
+                    if "error" in chunk:
+                        log(f"  ERROR: {chunk['error']}")
+                        raise Exception(chunk["error"])
+            except docker.errors.BuildError as e:
+                log(f"[build] FAILED: {e}")
+                for item in e.build_log:
+                    if "stream" in item:
+                        log(f"  {item['stream'].strip()}")
+                    if "error" in item:
+                        log(f"  ERROR: {item['error']}")
+                await _save_status("failed")
+                return
+            except Exception as e:
+                log(f"[build] FAILED: {e}")
+                await _save_status("failed")
+                return
+
+            log("[build] Image built successfully")
+
+            # Allocate host port and run container
+            host_port = _allocate_port()
+            container_name = f"awsclone-deploy-{deploy_id}"
+
+            log(f"[deploy] Starting container on port {host_port} ...")
+
+            def _docker_run():
+                client = _get_docker()
+                # Remove old container if exists
+                try:
+                    old = client.containers.get(container_name)
+                    old.remove(force=True)
+                except docker.errors.NotFound:
+                    pass
+
+                container = client.containers.run(
+                    image_tag,
+                    detach=True,
+                    name=container_name,
+                    ports={f"{container_port}/tcp": host_port},
+                    labels={"awsclone": "true", "deploy_id": deploy_id},
+                    mem_limit="256m",
+                    restart_policy={"Name": "unless-stopped"},
+                )
+                container.reload()
+                return container
+
+            try:
+                container = await asyncio.to_thread(_docker_run)
+            except Exception as e:
+                log(f"[deploy] FAILED to start container: {e}")
+                await _save_status("failed")
+                return
+
+            log(f"[deploy] Container started: {container.short_id}")
+            log(f"[deploy] URL: http://{SERVER_PUBLIC_IP or 'localhost'}:{host_port}")
+            log("[deploy] Deployment successful!")
+
+            # Save final state
+            async with async_session() as db:
+                result = await db.execute(select(Deployment).where(Deployment.id == deploy_id))
+                dep = result.scalar_one_or_none()
+                if dep:
+                    dep.status = "running"
+                    dep.build_log = "\n".join(log_lines)
+                    dep.docker_image_id = image.id
+                    dep.docker_container_id = container.id
+                    dep.port = host_port
+                    dep.project_type = info["type"]
+                    dep.project_label = info["label"]
+                    await db.commit()
+
+        except Exception as e:
+            log(f"[error] Unexpected: {e}")
+            await _save_status("failed")
+
+
+# ── Extract ZIP with folder normalization ────────────────────────────
+
+def _extract_zip(zip_bytes: bytes, dest: Path):
+    """Extract ZIP, flattening if there's a single top-level directory."""
+    dest.mkdir(parents=True, exist_ok=True)
+
+    buf = io.BytesIO(zip_bytes)
+    with zipfile.ZipFile(buf) as zf:
+        # Check if all entries share a common top-level dir
+        names = zf.namelist()
+        top_dirs = set()
+        for n in names:
+            parts = n.split("/")
+            if len(parts) > 1:
+                top_dirs.add(parts[0])
+            else:
+                top_dirs.add("")  # file at root
+
+        # If exactly one top-level dir and no root files, flatten
+        flatten = len(top_dirs) == 1 and "" not in top_dirs
+        prefix = top_dirs.pop() + "/" if flatten else ""
+
+        for member in zf.infolist():
+            if member.is_dir():
+                continue
+            # Strip the prefix if flattening
+            target = member.filename
+            if flatten and target.startswith(prefix):
+                target = target[len(prefix):]
+            if not target:
+                continue
+
+            target_path = dest / target
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member) as src, open(target_path, "wb") as dst:
+                dst.write(src.read())
+
+
+# ── API Endpoints ─────────────────────────────────────────────────────
+
+@router.post("/projects")
+async def create_deployment(
+    name: str = Form(...),
+    file: UploadFile = File(...),
+    user: User = Depends(require_permission("ec2:RunInstance")),
+    db: AsyncSession = Depends(get_db),
+):
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Please upload a ZIP file")
+
+    deploy_id = generate_id()
+    project_dir = DEPLOYS_DIR / deploy_id
+
+    # Save deployment record
+    deployment = Deployment(
+        id=deploy_id,
+        name=name,
+        owner_id=user.id,
+        status="uploading",
+    )
+    db.add(deployment)
+    await db.flush()
+
+    # Read and extract ZIP
+    zip_bytes = await file.read()
+    try:
+        await asyncio.to_thread(_extract_zip, zip_bytes, project_dir)
+    except Exception as e:
+        deployment.status = "failed"
+        deployment.build_log = f"Failed to extract ZIP: {e}"
+        await db.flush()
+        raise HTTPException(status_code=400, detail=f"Invalid ZIP file: {e}")
+
+    # Detect project type
+    info = _detect_project(project_dir)
+    if info["type"] == "unknown":
+        deployment.status = "failed"
+        deployment.build_log = "Could not detect project type. Include index.html, package.json, requirements.txt, or a Dockerfile."
+        deployment.project_type = "unknown"
+        deployment.project_label = "Unknown"
+        await db.flush()
+        raise HTTPException(status_code=400, detail="Unknown project type. Make sure your ZIP contains a recognizable project.")
+
+    deployment.project_type = info["type"]
+    deployment.project_label = info["label"]
+    deployment.status = "queued"
+    await db.flush()
+
+    # Start background build
+    asyncio.create_task(_build_and_deploy(deploy_id, project_dir, info))
+
+    return _deploy_to_dict(deployment)
+
+
+@router.get("/projects")
+async def list_deployments(
+    user: User = Depends(require_permission("ec2:DescribeInstances")),
+    db: AsyncSession = Depends(get_db),
+):
+    stmt = select(Deployment).order_by(Deployment.created_at.desc())
+    if not user.is_root:
+        stmt = stmt.where(Deployment.owner_id == user.id)
+    result = await db.execute(stmt)
+    return [_deploy_to_dict(d) for d in result.scalars().all()]
+
+
+@router.get("/projects/{deploy_id}")
+async def get_deployment(
+    deploy_id: str,
+    user: User = Depends(require_permission("ec2:DescribeInstances")),
+    db: AsyncSession = Depends(get_db),
+):
+    dep = await _get_deploy(deploy_id, db)
+    return _deploy_to_dict(dep)
+
+
+@router.get("/projects/{deploy_id}/logs")
+async def get_deploy_logs(
+    deploy_id: str,
+    user: User = Depends(require_permission("ec2:DescribeInstances")),
+    db: AsyncSession = Depends(get_db),
+):
+    dep = await _get_deploy(deploy_id, db)
+
+    # Also get runtime logs if container is running
+    runtime_logs = ""
+    if dep.docker_container_id and dep.status == "running":
+        try:
+            def _get_logs():
+                c = _get_docker().containers.get(dep.docker_container_id)
+                return c.logs(stdout=True, stderr=True, tail=100).decode("utf-8", errors="replace")
+            runtime_logs = await asyncio.to_thread(_get_logs)
+        except Exception:
+            pass
+
+    return {
+        "build_log": dep.build_log or "",
+        "runtime_log": runtime_logs,
+    }
+
+
+@router.post("/projects/{deploy_id}/redeploy")
+async def redeploy(
+    deploy_id: str,
+    user: User = Depends(require_permission("ec2:RunInstance")),
+    db: AsyncSession = Depends(get_db),
+):
+    dep = await _get_deploy(deploy_id, db)
+    project_dir = DEPLOYS_DIR / deploy_id
+
+    if not project_dir.exists():
+        raise HTTPException(status_code=400, detail="Project files no longer exist. Upload again.")
+
+    # Stop existing container
+    if dep.docker_container_id:
+        try:
+            await asyncio.to_thread(
+                lambda: _get_docker().containers.get(dep.docker_container_id).remove(force=True)
+            )
+        except Exception:
+            pass
+
+    dep.status = "queued"
+    dep.build_log = ""
+    dep.docker_container_id = None
+    await db.flush()
+
+    info = _detect_project(project_dir)
+    asyncio.create_task(_build_and_deploy(deploy_id, project_dir, info))
+
+    return _deploy_to_dict(dep)
+
+
+@router.post("/projects/{deploy_id}/stop")
+async def stop_deployment(
+    deploy_id: str,
+    user: User = Depends(require_permission("ec2:StopInstance")),
+    db: AsyncSession = Depends(get_db),
+):
+    dep = await _get_deploy(deploy_id, db)
+    if dep.docker_container_id:
+        try:
+            await asyncio.to_thread(
+                lambda: _get_docker().containers.get(dep.docker_container_id).stop(timeout=10)
+            )
+        except Exception:
+            pass
+    dep.status = "stopped"
+    await db.flush()
+    return _deploy_to_dict(dep)
+
+
+@router.post("/projects/{deploy_id}/start")
+async def start_deployment(
+    deploy_id: str,
+    user: User = Depends(require_permission("ec2:StartInstance")),
+    db: AsyncSession = Depends(get_db),
+):
+    dep = await _get_deploy(deploy_id, db)
+    if not dep.docker_container_id:
+        raise HTTPException(status_code=400, detail="No container. Redeploy instead.")
+    try:
+        await asyncio.to_thread(
+            lambda: _get_docker().containers.get(dep.docker_container_id).start()
+        )
+    except docker.errors.NotFound:
+        raise HTTPException(status_code=404, detail="Container not found. Redeploy instead.")
+    dep.status = "running"
+    await db.flush()
+    return _deploy_to_dict(dep)
+
+
+@router.delete("/projects/{deploy_id}")
+async def delete_deployment(
+    deploy_id: str,
+    user: User = Depends(require_permission("ec2:TerminateInstance")),
+    db: AsyncSession = Depends(get_db),
+):
+    dep = await _get_deploy(deploy_id, db)
+
+    # Remove container
+    if dep.docker_container_id:
+        try:
+            await asyncio.to_thread(
+                lambda: _get_docker().containers.get(dep.docker_container_id).remove(force=True)
+            )
+        except Exception:
+            pass
+
+    # Remove image
+    if dep.docker_image_id:
+        try:
+            await asyncio.to_thread(
+                lambda: _get_docker().images.remove(dep.docker_image_id, force=True)
+            )
+        except Exception:
+            pass
+
+    # Remove project files
+    project_dir = DEPLOYS_DIR / dep.id
+    if project_dir.exists():
+        shutil.rmtree(project_dir, ignore_errors=True)
+
+    await db.delete(dep)
+    await db.flush()
+    return {"detail": "Deployment deleted"}
+
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+async def _get_deploy(deploy_id: str, db: AsyncSession) -> Deployment:
+    result = await db.execute(select(Deployment).where(Deployment.id == deploy_id))
+    dep = result.scalar_one_or_none()
+    if not dep:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    return dep
+
+
+def _deploy_to_dict(dep: Deployment) -> dict:
+    url = None
+    if dep.port and SERVER_PUBLIC_IP:
+        url = f"http://{SERVER_PUBLIC_IP}:{dep.port}"
+
+    return {
+        "id": dep.id,
+        "name": dep.name,
+        "owner_id": dep.owner_id,
+        "project_type": dep.project_type,
+        "project_label": dep.project_label,
+        "status": dep.status,
+        "port": dep.port,
+        "url": url,
+        "created_at": dep.created_at.isoformat() if dep.created_at else None,
+        "updated_at": dep.updated_at.isoformat() if dep.updated_at else None,
+    }

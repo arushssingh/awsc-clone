@@ -212,6 +212,26 @@ class Alarm(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+# ── Deploy ──────────────────────────────────────────────────────────────
+
+class Deployment(Base):
+    __tablename__ = "deployments"
+
+    id = Column(String, primary_key=True, default=generate_id)
+    name = Column(String, nullable=False)
+    owner_id = Column(String, ForeignKey("users.id"), nullable=False)
+    project_type = Column(String, nullable=True)       # static, vite, cra, nextjs, node-server, python, dockerfile
+    project_label = Column(String, nullable=True)       # Human-readable label
+    status = Column(String, nullable=False, default="uploading")  # uploading, building, running, failed, stopped
+    build_log = Column(Text, nullable=True)
+    docker_image_id = Column(String, nullable=True)
+    docker_container_id = Column(String, nullable=True)
+    port = Column(Integer, nullable=True)
+    env_vars = Column(Text, default="{}")               # JSON
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # ── S3 ───────────────────────────────────────────────────────────────────
 
 class Bucket(Base):

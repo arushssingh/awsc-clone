@@ -390,7 +390,7 @@ async def start_tunnel(
 
     def _start_and_wait():
         proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", f"http://localhost:{host_port}"],
+            ["cloudflared", "tunnel", "--url", f"http://host.docker.internal:{host_port}"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

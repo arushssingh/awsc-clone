@@ -26,6 +26,8 @@ services:
       - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/bin/cloudflared:/usr/bin/cloudflared:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     expose:
       - "8000"
     depends_on:

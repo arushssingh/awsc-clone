@@ -1,6 +1,5 @@
 import asyncio
 import time
-from collections import defaultdict
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -27,23 +26,18 @@ from services.iam import router as iam_router
 # ── Reconciliation daemon ─────────────────────────────────────────────────
 
 async def reconcile_instances():
-    """
-    On startup, sync instance states with actual Docker container states.
-    Instances that no longer have a live container get marked 'stopped'.
-    """
+    """On startup, sync instance states with actual Docker containers."""
     try:
         import docker as docker_lib
         d = docker_lib.from_env()
     except Exception:
-        return  # Docker not available (dev machine without Docker)
+        return
 
     async with async_session() as db:
         result = await db.execute(
             select(Instance).where(Instance.state.in_(["running", "pending", "stopping"]))
         )
-        instances = result.scalars().all()
-
-        for inst in instances:
+        for inst in result.scalars().all():
             if not inst.docker_container_id:
                 inst.state = "stopped"
                 continue
@@ -53,28 +47,38 @@ async def reconcile_instances():
                     inst.state = "stopped"
             except Exception:
                 inst.state = "stopped"
-
         await db.commit()
 
 
-# ── Rate limiting ─────────────────────────────────────────────────────────
+# ── Rate limiting (fixed-window, auto-cleanup) ───────────────────────────
 
-# Simple fixed-window rate limiter: 120 requests per minute per IP
-_rate_limit_window = 60      # seconds
-_rate_limit_max = 120        # requests per window
-_rate_buckets: dict[str, list[float]] = defaultdict(list)
+_RATE_WINDOW = 60       # seconds
+_RATE_MAX = 120         # requests per window per IP
+_rate_buckets: dict[str, list[float]] = {}
+_last_cleanup = 0.0
 
 
 def _check_rate_limit(ip: str) -> bool:
-    """Returns True if the request is allowed."""
+    global _last_cleanup
     now = time.monotonic()
-    window_start = now - _rate_limit_window
-    timestamps = _rate_buckets[ip]
-    # Drop timestamps outside the window
-    _rate_buckets[ip] = [t for t in timestamps if t > window_start]
-    if len(_rate_buckets[ip]) >= _rate_limit_max:
+    cutoff = now - _RATE_WINDOW
+
+    # Cleanup stale IPs every 5 minutes to prevent memory leak
+    if now - _last_cleanup > 300:
+        stale = [k for k, v in _rate_buckets.items() if not v or v[-1] < cutoff]
+        for k in stale:
+            del _rate_buckets[k]
+        _last_cleanup = now
+
+    timestamps = _rate_buckets.get(ip, [])
+    timestamps = [t for t in timestamps if t > cutoff]
+
+    if len(timestamps) >= _RATE_MAX:
+        _rate_buckets[ip] = timestamps
         return False
-    _rate_buckets[ip].append(now)
+
+    timestamps.append(now)
+    _rate_buckets[ip] = timestamps
     return True
 
 
@@ -82,22 +86,15 @@ def _check_rate_limit(ip: str) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create all tables
     await init_db()
-
-    # Reconcile EC2 instance states with Docker reality
     await reconcile_instances()
 
-    # Launch background tasks
     tasks = [
         asyncio.create_task(metrics_collector()),
         asyncio.create_task(alarm_evaluator()),
         asyncio.create_task(metrics_cleanup()),
     ]
-
     yield
-
-    # Shutdown: cancel background tasks
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -115,20 +112,15 @@ app = FastAPI(
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    # Skip rate limiting for health checks
     if request.url.path == "/api/v1/health":
         return await call_next(request)
 
     ip = request.client.host if request.client else "unknown"
     if not _check_rate_limit(ip):
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Too many requests. Please slow down."},
-        )
+        return JSONResponse(status_code=429, content={"detail": "Too many requests"})
     return await call_next(request)
 
 
-# CORS — allow frontend dev server and production
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -136,7 +128,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # ── Routers ──────────────────────────────────────────────────────────────
 
@@ -149,8 +140,6 @@ app.include_router(route53_router)
 app.include_router(cloudwatch_router)
 app.include_router(iam_router)
 
-
-# ── Health check ─────────────────────────────────────────────────────────
 
 @app.get("/api/v1/health")
 async def health():

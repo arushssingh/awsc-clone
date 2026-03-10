@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import api from '../api';
+import { useToast } from '../components/Toast';
 
 export default function Lambda() {
+  const toast = useToast();
   const [functions, setFunctions] = useState([]);
   const [showCreate, setShowCreate] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -22,7 +24,7 @@ export default function Lambda() {
 
   const create = async (e) => {
     e.preventDefault();
-    if (!codeFile) { alert('Please select a code ZIP file'); return; }
+    if (!codeFile) { toast.error('Please select a code ZIP file'); return; }
     const formData = new FormData();
     formData.append('metadata', JSON.stringify(form));
     formData.append('code', codeFile);
@@ -31,7 +33,7 @@ export default function Lambda() {
       setShowCreate(false);
       fetchFunctions();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to create function');
+      toast.error(err.response?.data?.detail || 'Failed to create function');
     }
   };
 
@@ -41,7 +43,7 @@ export default function Lambda() {
       await api.delete(`/lambda/functions/${id}`);
       fetchFunctions();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to delete');
+      toast.error(err.response?.data?.detail || 'Failed to delete');
     }
   };
 

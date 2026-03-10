@@ -1,15 +1,14 @@
 import json
 import secrets
-from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from auth import get_current_user, require_permission, hash_password
+from auth import require_permission, hash_password
 from database import (
     User, Role, Policy, ApiKey, UserRole, RolePolicy,
     get_db, generate_id,

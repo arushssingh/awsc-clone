@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import api from '../api';
+import { useToast } from '../components/Toast';
 
 const STATE_COLORS = {
   active: 'bg-green-500/20 text-green-400',
@@ -8,6 +9,7 @@ const STATE_COLORS = {
 };
 
 export default function Route53() {
+  const toast = useToast();
   const [domains, setDomains] = useState([]);
   const [instances, setInstances] = useState([]);
   const [showAdd, setShowAdd] = useState(false);
@@ -40,17 +42,17 @@ export default function Route53() {
       setShowAdd(false);
       fetchDomains();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to add domain');
+      toast.error(err.response?.data?.detail || 'Failed to add domain');
     }
   };
 
   const verify = async (id) => {
     try {
       const res = await api.post(`/route53/domains/${id}/verify`);
-      alert(res.data.message || 'DNS verification complete');
+      toast.success(res.data.message || 'DNS verification complete');
       fetchDomains();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Verification failed');
+      toast.error(err.response?.data?.detail || 'Verification failed');
     }
   };
 
@@ -60,7 +62,7 @@ export default function Route53() {
       await api.delete(`/route53/domains/${id}`);
       fetchDomains();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to delete');
+      toast.error(err.response?.data?.detail || 'Failed to delete');
     }
   };
 

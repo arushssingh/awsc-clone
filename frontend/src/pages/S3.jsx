@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import api from '../api';
+import { useToast } from '../components/Toast';
 
 export default function S3() {
+  const toast = useToast();
   const [buckets, setBuckets] = useState([]);
   const [showCreate, setShowCreate] = useState(false);
   const [name, setName] = useState('');
@@ -25,7 +27,7 @@ export default function S3() {
       setName('');
       fetchBuckets();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to create bucket');
+      toast.error(err.response?.data?.detail || 'Failed to create bucket');
     }
   };
 
@@ -35,7 +37,7 @@ export default function S3() {
       await api.delete(`/s3/buckets/${bucketName}`);
       fetchBuckets();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to delete bucket');
+      toast.error(err.response?.data?.detail || 'Failed to delete bucket');
     }
   };
 

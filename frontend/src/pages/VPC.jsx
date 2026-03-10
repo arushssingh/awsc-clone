@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import api from '../api';
+import { useToast } from '../components/Toast';
 
 export default function VPC() {
+  const toast = useToast();
   const [vpcs, setVpcs] = useState([]);
   const [showCreate, setShowCreate] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -25,7 +27,7 @@ export default function VPC() {
       setForm({ name: '', cidr_block: '10.0.0.0/16' });
       fetchVpcs();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to create VPC');
+      toast.error(err.response?.data?.detail || 'Failed to create VPC');
     }
   };
 
@@ -35,7 +37,7 @@ export default function VPC() {
       await api.delete(`/vpc/vpcs/${id}`);
       fetchVpcs();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to delete VPC');
+      toast.error(err.response?.data?.detail || 'Failed to delete VPC');
     }
   };
 

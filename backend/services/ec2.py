@@ -1,15 +1,18 @@
+import asyncio
+import io
 import json
+import tarfile
 import threading
 from typing import Optional
 
 import docker
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from auth import get_current_user, require_permission
-from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END
+from auth import require_permission
+from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END, SERVER_PUBLIC_IP
 from database import Instance, VPC, User, get_db, generate_id
 
 router = APIRouter(prefix="/api/v1/ec2", tags=["ec2"])
@@ -44,32 +47,14 @@ class LaunchInstanceRequest(BaseModel):
     image: str = "nginx:alpine"
     instance_type: str = "t2.micro"
     vpc_id: Optional[str] = None
-    port_mappings: Optional[dict] = None   # {"80": 0} — 0 means auto-assign
+    port_mappings: Optional[dict] = None
     environment: Optional[dict] = None
     command: Optional[str] = None
-
-
-class InstanceResponse(BaseModel):
-    id: str
-    name: str
-    owner_id: str
-    docker_container_id: Optional[str]
-    image: str
-    instance_type: str
-    state: str
-    vpc_id: Optional[str]
-    private_ip: Optional[str]
-    port_mappings: Optional[dict]
-    cpu_limit: float
-    memory_limit: int
-    created_at: str
-    updated_at: str
 
 
 # ── Port allocation ──────────────────────────────────────────────────────
 
 def _allocate_port() -> int:
-    """Allocate the next available host port."""
     global _next_port
     with _port_lock:
         port = _next_port
@@ -79,13 +64,7 @@ def _allocate_port() -> int:
         return port
 
 
-def _build_port_bindings(port_mappings: dict) -> dict:
-    """
-    Convert user port mappings to Docker format.
-    Input:  {"80": 0, "443": 8443}
-    Output: {"80/tcp": 49152, "443/tcp": 8443}
-    Also returns the resolved mappings for DB storage.
-    """
+def _build_port_bindings(port_mappings: dict) -> tuple[dict, dict]:
     bindings = {}
     resolved = {}
     for container_port, host_port in port_mappings.items():
@@ -111,18 +90,11 @@ async def list_instances(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    if user.is_root:
-        result = await db.execute(
-            select(Instance).where(Instance.state != "terminated")
-        )
-    else:
-        result = await db.execute(
-            select(Instance).where(
-                Instance.owner_id == user.id, Instance.state != "terminated"
-            )
-        )
-    instances = result.scalars().all()
-    return [_instance_to_dict(i) for i in instances]
+    stmt = select(Instance).where(Instance.state != "terminated")
+    if not user.is_root:
+        stmt = stmt.where(Instance.owner_id == user.id)
+    result = await db.execute(stmt)
+    return [_instance_to_dict(i) for i in result.scalars().all()]
 
 
 @router.get("/instances/{instance_id}")
@@ -131,8 +103,7 @@ async def get_instance(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    instance = await _get_instance(instance_id, db)
-    return _instance_to_dict(instance)
+    return _instance_to_dict(await _get_instance(instance_id, db))
 
 
 @router.post("/instances")
@@ -141,30 +112,26 @@ async def launch_instance(
     user: User = Depends(require_permission("ec2:RunInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    # Validate instance type
     itype = INSTANCE_TYPES.get(body.instance_type)
     if not itype:
         raise HTTPException(status_code=400, detail=f"Invalid instance type: {body.instance_type}")
 
     instance_id = generate_id()
 
-    # Build port bindings
     port_bindings = {}
     resolved_ports = {}
     if body.port_mappings:
         port_bindings, resolved_ports = _build_port_bindings(body.port_mappings)
 
-    # Determine Docker network
     network_name = None
     if body.vpc_id:
         result = await db.execute(select(VPC).where(VPC.id == body.vpc_id))
-        vpc = result.scalar_one_or_none()
-        if not vpc:
+        if not result.scalar_one_or_none():
             raise HTTPException(status_code=404, detail="VPC not found")
-        network_name = f"awsclone-vpc-{vpc.id}"
+        network_name = f"awsclone-vpc-{body.vpc_id}"
 
-    # Launch container
-    try:
+    # Run Docker operations off the event loop
+    def _launch():
         run_kwargs = {
             "image": body.image,
             "name": f"awsclone-{instance_id}",
@@ -172,60 +139,47 @@ async def launch_instance(
             "nano_cpus": itype["nano_cpus"],
             "mem_limit": itype["mem_limit"],
             "environment": body.environment or {},
-            "labels": {
-                "awsclone": "true",
-                "instance_id": instance_id,
-                "owner": user.id,
-            },
+            "labels": {"awsclone": "true", "instance_id": instance_id, "owner": user.id},
         }
-
         if port_bindings:
             run_kwargs["ports"] = port_bindings
-
         if network_name:
             run_kwargs["network"] = network_name
-
         if body.command:
             run_kwargs["command"] = body.command
 
         container = get_docker().containers.run(**run_kwargs)
+        container.reload()
+        return container
+
+    try:
+        container = await asyncio.to_thread(_launch)
     except docker.errors.ImageNotFound:
-        raise HTTPException(status_code=400, detail=f"Image not found: {body.image}. It will be pulled on first use — try again in a moment.")
+        raise HTTPException(status_code=400, detail=f"Image not found: {body.image}. Try again in a moment — it will be pulled.")
     except docker.errors.APIError as e:
         raise HTTPException(status_code=500, detail=f"Docker error: {e.explanation}")
 
-    # Get private IP
+    # Extract private IP
     private_ip = None
     try:
-        container.reload()
-        nets = container.attrs["NetworkSettings"]["Networks"]
-        for net_info in nets.values():
+        for net_info in container.attrs["NetworkSettings"]["Networks"].values():
             if net_info.get("IPAddress"):
                 private_ip = net_info["IPAddress"]
                 break
     except Exception:
         pass
 
-    # Save to DB
     instance = Instance(
-        id=instance_id,
-        name=body.name,
-        owner_id=user.id,
-        docker_container_id=container.id,
-        image=body.image,
-        instance_type=body.instance_type,
-        state="running",
-        vpc_id=body.vpc_id,
-        private_ip=private_ip,
+        id=instance_id, name=body.name, owner_id=user.id,
+        docker_container_id=container.id, image=body.image,
+        instance_type=body.instance_type, state="running",
+        vpc_id=body.vpc_id, private_ip=private_ip,
         port_mappings=json.dumps(resolved_ports) if resolved_ports else None,
-        cpu_limit=itype["cpu"],
-        memory_limit=itype["memory"],
-        environment=json.dumps(body.environment or {}),
-        command=body.command,
+        cpu_limit=itype["cpu"], memory_limit=itype["memory"],
+        environment=json.dumps(body.environment or {}), command=body.command,
     )
     db.add(instance)
     await db.flush()
-
     return _instance_to_dict(instance)
 
 
@@ -243,8 +197,9 @@ async def stop_instance(
     await db.flush()
 
     try:
-        container = get_docker().containers.get(instance.docker_container_id)
-        container.stop(timeout=10)
+        await asyncio.to_thread(
+            lambda: get_docker().containers.get(instance.docker_container_id).stop(timeout=10)
+        )
     except docker.errors.NotFound:
         pass
     except docker.errors.APIError as e:
@@ -265,21 +220,22 @@ async def start_instance(
     if instance.state != "stopped":
         raise HTTPException(status_code=400, detail="Instance is not stopped")
 
+    def _start():
+        c = get_docker().containers.get(instance.docker_container_id)
+        c.start()
+        c.reload()
+        return c
+
     try:
-        container = get_docker().containers.get(instance.docker_container_id)
-        container.start()
+        container = await asyncio.to_thread(_start)
     except docker.errors.NotFound:
         raise HTTPException(status_code=404, detail="Container no longer exists")
     except docker.errors.APIError as e:
         raise HTTPException(status_code=500, detail=f"Docker error: {e.explanation}")
 
     instance.state = "running"
-
-    # Refresh private IP
     try:
-        container.reload()
-        nets = container.attrs["NetworkSettings"]["Networks"]
-        for net_info in nets.values():
+        for net_info in container.attrs["NetworkSettings"]["Networks"].values():
             if net_info.get("IPAddress"):
                 instance.private_ip = net_info["IPAddress"]
                 break
@@ -301,8 +257,9 @@ async def reboot_instance(
         raise HTTPException(status_code=400, detail="Instance is not running")
 
     try:
-        container = get_docker().containers.get(instance.docker_container_id)
-        container.restart(timeout=10)
+        await asyncio.to_thread(
+            lambda: get_docker().containers.get(instance.docker_container_id).restart(timeout=10)
+        )
     except docker.errors.NotFound:
         raise HTTPException(status_code=404, detail="Container no longer exists")
     except docker.errors.APIError as e:
@@ -319,11 +276,11 @@ async def terminate_instance(
 ):
     instance = await _get_instance(instance_id, db)
 
-    # Remove Docker container
     if instance.docker_container_id:
         try:
-            container = get_docker().containers.get(instance.docker_container_id)
-            container.remove(force=True)
+            await asyncio.to_thread(
+                lambda: get_docker().containers.get(instance.docker_container_id).remove(force=True)
+            )
         except docker.errors.NotFound:
             pass
         except docker.errors.APIError as e:
@@ -347,8 +304,11 @@ async def get_instance_logs(
         return {"logs": ""}
 
     try:
-        container = get_docker().containers.get(instance.docker_container_id)
-        logs = container.logs(stdout=True, stderr=True, tail=tail).decode("utf-8", errors="replace")
+        logs = await asyncio.to_thread(
+            lambda: get_docker().containers.get(instance.docker_container_id)
+                .logs(stdout=True, stderr=True, tail=tail)
+                .decode("utf-8", errors="replace")
+        )
         return {"logs": logs}
     except docker.errors.NotFound:
         return {"logs": "Container not found"}
@@ -367,34 +327,65 @@ async def get_instance_stats(
         raise HTTPException(status_code=400, detail="No container associated")
 
     try:
-        container = get_docker().containers.get(instance.docker_container_id)
-        stats = container.stats(stream=False)
-
-        # Calculate CPU %
-        cpu_delta = (
-            stats["cpu_stats"]["cpu_usage"]["total_usage"]
-            - stats["precpu_stats"]["cpu_usage"]["total_usage"]
+        stats = await asyncio.to_thread(
+            lambda: get_docker().containers.get(instance.docker_container_id).stats(stream=False)
         )
-        system_delta = (
-            stats["cpu_stats"]["system_cpu_usage"]
-            - stats["precpu_stats"]["system_cpu_usage"]
-        )
-        cpu_percent = (cpu_delta / system_delta) * 100.0 if system_delta > 0 else 0.0
 
-        # Memory
-        mem_usage = stats["memory_stats"].get("usage", 0) / (1024 * 1024)
+        cpu_delta = stats["cpu_stats"]["cpu_usage"]["total_usage"] - stats["precpu_stats"]["cpu_usage"]["total_usage"]
+        sys_delta = stats["cpu_stats"]["system_cpu_usage"] - stats["precpu_stats"]["system_cpu_usage"]
+        cpu_pct = (cpu_delta / sys_delta) * 100.0 if sys_delta > 0 else 0.0
+        mem_used = stats["memory_stats"].get("usage", 0) / (1024 * 1024)
         mem_limit = stats["memory_stats"].get("limit", 0) / (1024 * 1024)
 
         return {
-            "cpu_percent": round(cpu_percent, 2),
-            "memory_usage_mb": round(mem_usage, 2),
+            "cpu_percent": round(cpu_pct, 2),
+            "memory_usage_mb": round(mem_used, 2),
             "memory_limit_mb": round(mem_limit, 2),
-            "memory_percent": round((mem_usage / mem_limit) * 100, 2) if mem_limit > 0 else 0,
+            "memory_percent": round((mem_used / mem_limit) * 100, 2) if mem_limit > 0 else 0,
         }
     except docker.errors.NotFound:
         raise HTTPException(status_code=404, detail="Container not found")
     except docker.errors.APIError:
         raise HTTPException(status_code=500, detail="Failed to get stats")
+
+
+@router.post("/instances/{instance_id}/upload")
+async def upload_files(
+    instance_id: str,
+    files: list[UploadFile] = File(...),
+    user: User = Depends(require_permission("ec2:DescribeInstances")),
+    db: AsyncSession = Depends(get_db),
+):
+    instance = await _get_instance(instance_id, db)
+    if instance.state != "running":
+        raise HTTPException(status_code=400, detail="Instance must be running to upload files")
+    if not instance.docker_container_id:
+        raise HTTPException(status_code=400, detail="No container associated")
+
+    # Read all files first (async), then do Docker copy in thread
+    file_data = []
+    for upload in files:
+        content = await upload.read()
+        file_data.append((upload.filename, content))
+
+    def _copy_files():
+        container = get_docker().containers.get(instance.docker_container_id)
+        tar_buffer = io.BytesIO()
+        with tarfile.open(fileobj=tar_buffer, mode="w") as tar:
+            for name, content in file_data:
+                info = tarfile.TarInfo(name=name)
+                info.size = len(content)
+                tar.addfile(info, io.BytesIO(content))
+        tar_buffer.seek(0)
+        container.put_archive("/usr/share/nginx/html", tar_buffer)
+
+    try:
+        await asyncio.to_thread(_copy_files)
+        return {"detail": f"Uploaded {len(files)} file(s) successfully"}
+    except docker.errors.NotFound:
+        raise HTTPException(status_code=404, detail="Container not found")
+    except docker.errors.APIError as e:
+        raise HTTPException(status_code=500, detail=f"Docker error: {e.explanation}")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -415,6 +406,11 @@ def _instance_to_dict(instance: Instance) -> dict:
         except json.JSONDecodeError:
             port_mappings = {}
 
+    public_urls = {}
+    if port_mappings and SERVER_PUBLIC_IP:
+        for container_port, host_port in port_mappings.items():
+            public_urls[container_port] = f"http://{SERVER_PUBLIC_IP}:{host_port}"
+
     return {
         "id": instance.id,
         "name": instance.name,
@@ -426,6 +422,7 @@ def _instance_to_dict(instance: Instance) -> dict:
         "vpc_id": instance.vpc_id,
         "private_ip": instance.private_ip,
         "port_mappings": port_mappings,
+        "public_urls": public_urls,
         "cpu_limit": instance.cpu_limit,
         "memory_limit": instance.memory_limit,
         "created_at": instance.created_at.isoformat(),

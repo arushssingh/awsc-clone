@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import api from '../api';
+import { useToast } from '../components/Toast';
 
 const STATE_COLORS = {
   running: 'bg-green-500/20 text-green-400',
@@ -11,6 +12,7 @@ const STATE_COLORS = {
 };
 
 export default function EC2() {
+  const toast = useToast();
   const [instances, setInstances] = useState([]);
   const [showLaunch, setShowLaunch] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -42,7 +44,7 @@ export default function EC2() {
       setShowLaunch(false);
       fetchInstances();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Failed to launch');
+      toast.error(err.response?.data?.detail || 'Failed to launch');
     }
   };
 
@@ -55,7 +57,7 @@ export default function EC2() {
       }
       fetchInstances();
     } catch (err) {
-      alert(err.response?.data?.detail || `Failed to ${act}`);
+      toast.error(err.response?.data?.detail || `Failed to ${act}`);
     }
   };
 

@@ -1,8 +1,10 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import api from '../api';
+import { useToast } from '../components/Toast';
 
 export default function S3Bucket() {
+  const toast = useToast();
   const { name } = useParams();
   const navigate = useNavigate();
   const [objects, setObjects] = useState([]);
@@ -29,7 +31,7 @@ export default function S3Bucket() {
       await api.put(`/s3/buckets/${name}/objects/${encodeURIComponent(key)}`, formData);
       fetchObjects();
     } catch (err) {
-      alert(err.response?.data?.detail || 'Upload failed');
+      toast.error(err.response?.data?.detail || 'Upload failed');
     }
   };
 
@@ -38,7 +40,7 @@ export default function S3Bucket() {
       const res = await api.get(`/s3/buckets/${name}/objects/${encodeURIComponent(key)}`);
       window.open(res.data.url, '_blank');
     } catch (err) {
-      alert('Download failed');
+      toast.error('Download failed');
     }
   };
 
@@ -48,7 +50,7 @@ export default function S3Bucket() {
       await api.delete(`/s3/buckets/${name}/objects/${encodeURIComponent(key)}`);
       fetchObjects();
     } catch (err) {
-      alert('Delete failed');
+      toast.error('Delete failed');
     }
   };
 

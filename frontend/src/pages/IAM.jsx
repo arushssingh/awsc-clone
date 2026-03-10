@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react';
 import api from '../api';
+import { useToast } from '../components/Toast';
 
 const TABS = ['Users', 'Roles', 'Policies', 'API Keys'];
 
 export default function IAM() {
+  const toast = useToast();
   const [tab, setTab] = useState('Users');
   const [users, setUsers] = useState([]);
   const [roles, setRoles] = useState([]);
@@ -41,7 +43,7 @@ export default function IAM() {
       setShowCreate(false);
       setRoleForm({ name: '', description: '' });
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
   };
 
   const deleteRole = async (roleId) => {
@@ -49,7 +51,7 @@ export default function IAM() {
     try {
       await api.delete(`/iam/roles/${roleId}`);
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
   };
 
   const createPolicy = async (e) => {
@@ -60,7 +62,7 @@ export default function IAM() {
       setShowCreate(false);
       setPolicyForm({ name: '', document: '{"statements": [{"effect": "Allow", "actions": ["*"], "resources": ["*"]}]}' });
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || err.message || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || err.message || 'Failed'); }
   };
 
   const deletePolicy = async (policyId) => {
@@ -68,7 +70,7 @@ export default function IAM() {
     try {
       await api.delete(`/iam/policies/${policyId}`);
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
   };
 
   const createApiKey = async (e) => {
@@ -79,7 +81,7 @@ export default function IAM() {
       setShowCreate(false);
       setKeyDesc('');
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
   };
 
   const revokeKey = async (keyId) => {
@@ -87,14 +89,14 @@ export default function IAM() {
     try {
       await api.delete(`/iam/api-keys/${keyId}`);
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
   };
 
   const toggleUserActive = async (userId, currentlyActive) => {
     try {
       await api.put(`/iam/users/${userId}`, { is_active: !currentlyActive });
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
   };
 
   const assignRole = async (e) => {
@@ -105,7 +107,7 @@ export default function IAM() {
       setAssignModal(null);
       setSelectedAssign('');
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
   };
 
   const removeRole = async (userId, roleName) => {
@@ -114,7 +116,7 @@ export default function IAM() {
     try {
       await api.post('/iam/users/remove-role', { user_id: userId, role_id: role.id });
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
   };
 
   const attachPolicy = async (e) => {
@@ -125,7 +127,7 @@ export default function IAM() {
       setAssignModal(null);
       setSelectedAssign('');
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
   };
 
   const detachPolicy = async (roleId, policyName) => {
@@ -134,7 +136,7 @@ export default function IAM() {
     try {
       await api.post('/iam/roles/detach-policy', { role_id: roleId, policy_id: policy.id });
       fetchAll();
-    } catch (err) { alert(err.response?.data?.detail || 'Failed'); }
+    } catch (err) { toast.error(err.response?.data?.detail || 'Failed'); }
   };
 
   return (

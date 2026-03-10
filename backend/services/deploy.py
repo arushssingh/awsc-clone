@@ -555,6 +555,92 @@ async def delete_deployment(
     return {"detail": "Deployment deleted"}
 
 
+# ── Tunnel ───────────────────────────────────────────────────────────
+
+_deploy_tunnels: dict[str, dict] = {}  # deploy_id → {container_id, url}
+
+
+@router.post("/projects/{deploy_id}/tunnel/start")
+async def start_deploy_tunnel(
+    deploy_id: str,
+    user: User = Depends(require_permission("ec2:DescribeInstances")),
+    db: AsyncSession = Depends(get_db),
+):
+    dep = await _get_deploy(deploy_id, db)
+    if dep.status != "running":
+        raise HTTPException(status_code=400, detail="Deployment must be running")
+    if not dep.port:
+        raise HTTPException(status_code=400, detail="Deployment has no port assigned")
+
+    _stop_deploy_tunnel(deploy_id)
+
+    def _start_and_wait():
+        import time
+        container = _get_docker().containers.run(
+            "cloudflare/cloudflared:latest",
+            command=["tunnel", "--url", f"http://localhost:{dep.port}"],
+            network_mode="host",
+            detach=True,
+            name=f"awsclone-deploy-tunnel-{deploy_id}",
+            labels={"awsclone": "true", "tunnel_for": deploy_id},
+            remove=False,
+        )
+        url = None
+        for _ in range(30):
+            time.sleep(1)
+            logs = container.logs().decode("utf-8", errors="replace")
+            m = re.search(r"https://[a-z0-9\-]+\.trycloudflare\.com", logs)
+            if m:
+                url = m.group(0)
+                break
+        return container, url
+
+    try:
+        container, url = await asyncio.to_thread(_start_and_wait)
+    except docker.errors.ImageNotFound:
+        raise HTTPException(status_code=500, detail="Pulling cloudflared image... Try again in 30 seconds.")
+    except docker.errors.APIError as e:
+        raise HTTPException(status_code=500, detail=f"Docker error: {e.explanation}")
+
+    if not url:
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="Tunnel started but could not get URL.")
+
+    _deploy_tunnels[deploy_id] = {"container_id": container.id, "url": url}
+    return {"tunnel_url": url}
+
+
+@router.delete("/projects/{deploy_id}/tunnel/stop")
+async def stop_deploy_tunnel(
+    deploy_id: str,
+    user: User = Depends(require_permission("ec2:DescribeInstances")),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_deploy(deploy_id, db)
+    if deploy_id not in _deploy_tunnels:
+        raise HTTPException(status_code=404, detail="No active tunnel for this deployment")
+    _stop_deploy_tunnel(deploy_id)
+    return {"detail": "Tunnel stopped"}
+
+
+def _stop_deploy_tunnel(deploy_id: str):
+    if deploy_id in _deploy_tunnels:
+        try:
+            c = _get_docker().containers.get(_deploy_tunnels[deploy_id]["container_id"])
+            c.remove(force=True)
+        except Exception:
+            pass
+        del _deploy_tunnels[deploy_id]
+    try:
+        c = _get_docker().containers.get(f"awsclone-deploy-tunnel-{deploy_id}")
+        c.remove(force=True)
+    except Exception:
+        pass
+
+
 # ── Helpers ──────────────────────────────────────────────────────────
 
 async def _get_deploy(deploy_id: str, db: AsyncSession) -> Deployment:
@@ -570,6 +656,8 @@ def _deploy_to_dict(dep: Deployment) -> dict:
     if dep.port and SERVER_PUBLIC_IP:
         url = f"http://{SERVER_PUBLIC_IP}:{dep.port}"
 
+    tunnel = _deploy_tunnels.get(dep.id)
+
     return {
         "id": dep.id,
         "name": dep.name,
@@ -579,6 +667,7 @@ def _deploy_to_dict(dep: Deployment) -> dict:
         "status": dep.status,
         "port": dep.port,
         "url": url,
+        "tunnel_url": tunnel["url"] if tunnel else None,
         "created_at": dep.created_at.isoformat() if dep.created_at else None,
         "updated_at": dep.updated_at.isoformat() if dep.updated_at else None,
     }

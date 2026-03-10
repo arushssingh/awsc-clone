@@ -19,6 +19,7 @@ export default function DeployDetail() {
   const [logs, setLogs] = useState({ build_log: '', runtime_log: '' });
   const [tab, setTab] = useState('overview');
   const [actionLoading, setActionLoading] = useState('');
+  const [tunnelLoading, setTunnelLoading] = useState(false);
   const logEndRef = useRef(null);
 
   const fetchDep = () => api.get(`/deploy/projects/${id}`).then(r => setDep(r.data)).catch(() => {});
@@ -34,6 +35,32 @@ export default function DeployDetail() {
   useEffect(() => {
     if (logEndRef.current) logEndRef.current.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
+
+  const startTunnel = async () => {
+    setTunnelLoading(true);
+    try {
+      await api.post(`/deploy/projects/${id}/tunnel/start`);
+      toast.success('Tunnel started');
+      fetchDep();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to start tunnel');
+    } finally {
+      setTunnelLoading(false);
+    }
+  };
+
+  const stopTunnel = async () => {
+    setTunnelLoading(true);
+    try {
+      await api.delete(`/deploy/projects/${id}/tunnel/stop`);
+      toast.success('Tunnel stopped');
+      fetchDep();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to stop tunnel');
+    } finally {
+      setTunnelLoading(false);
+    }
+  };
 
   const doAction = async (action, label) => {
     setActionLoading(action);
@@ -102,6 +129,45 @@ export default function DeployDetail() {
           </div>
           <button onClick={() => { navigator.clipboard.writeText(dep.url); toast.success('URL copied'); }}
             className="text-green-400 hover:text-green-300 text-xs bg-green-900/50 px-2 py-1 rounded">Copy</button>
+        </div>
+      )}
+
+      {/* Cloudflare Tunnel */}
+      {dep.status === 'running' && (
+        <div className="bg-orange-900/20 border border-orange-700/50 rounded-lg p-4 mb-6">
+          <div className="flex items-center justify-between mb-2">
+            <div>
+              <p className="text-sm font-medium text-orange-300">Cloudflare Tunnel</p>
+              <p className="text-xs text-gray-500">Share publicly via trycloudflare.com</p>
+            </div>
+            <div className="flex items-center gap-2">
+              {dep.tunnel_url && (
+                <button onClick={startTunnel} disabled={tunnelLoading}
+                  className="text-xs bg-orange-800/50 hover:bg-orange-700/50 text-orange-300 px-2 py-1 rounded disabled:opacity-50">
+                  New URL
+                </button>
+              )}
+              {dep.tunnel_url ? (
+                <button onClick={stopTunnel} disabled={tunnelLoading}
+                  className="text-xs bg-red-900/50 hover:bg-red-800/50 text-red-400 px-3 py-1 rounded disabled:opacity-50">
+                  {tunnelLoading ? 'Stopping...' : 'Stop Tunnel'}
+                </button>
+              ) : (
+                <button onClick={startTunnel} disabled={tunnelLoading}
+                  className="text-xs bg-orange-600 hover:bg-orange-700 text-white px-3 py-1 rounded disabled:opacity-50">
+                  {tunnelLoading ? 'Starting...' : 'Start Tunnel'}
+                </button>
+              )}
+            </div>
+          </div>
+          {dep.tunnel_url && (
+            <div className="flex items-center gap-2 mt-2 bg-orange-900/30 rounded px-3 py-2">
+              <a href={dep.tunnel_url} target="_blank" rel="noreferrer"
+                className="text-orange-300 hover:text-orange-200 font-mono text-sm flex-1 truncate">{dep.tunnel_url}</a>
+              <button onClick={() => { navigator.clipboard.writeText(dep.tunnel_url); toast.success('Copied'); }}
+                className="text-orange-400 hover:text-orange-300 text-xs shrink-0">Copy</button>
+            </div>
+          )}
         </div>
       )}
 

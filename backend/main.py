@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 
-from database import init_db, Instance, get_db
+from database import init_db, Instance, async_session
 from auth import router as auth_router
 from services.ec2 import router as ec2_router
 from services.vpc import router as vpc_router
@@ -37,7 +37,7 @@ async def reconcile_instances():
     except Exception:
         return  # Docker not available (dev machine without Docker)
 
-    async with get_db() as db:
+    async with async_session() as db:
         result = await db.execute(
             select(Instance).where(Instance.state.in_(["running", "pending", "stopping"]))
         )

@@ -18,6 +18,10 @@ export default function EC2Detail() {
   // Copy link feedback
   const [copied, setCopied] = useState(null);
 
+  // Tunnel state
+  const [tunnelLoading, setTunnelLoading] = useState(false);
+  const [tunnelError, setTunnelError] = useState(null);
+
   const fetchInstance = () =>
     api.get(`/ec2/instances/${id}`)
       .then(res => setInstance(res.data))
@@ -62,6 +66,31 @@ export default function EC2Detail() {
     navigator.clipboard.writeText(url);
     setCopied(url);
     setTimeout(() => setCopied(null), 2000);
+  };
+
+  const startTunnel = async () => {
+    setTunnelLoading(true);
+    setTunnelError(null);
+    try {
+      await api.post(`/ec2/instances/${id}/tunnel/start`);
+      await fetchInstance(); // refresh to get tunnel_url
+    } catch (err) {
+      setTunnelError(err.response?.data?.detail || 'Failed to start tunnel');
+    } finally {
+      setTunnelLoading(false);
+    }
+  };
+
+  const stopTunnel = async () => {
+    setTunnelLoading(true);
+    try {
+      await api.delete(`/ec2/instances/${id}/tunnel/stop`);
+      await fetchInstance();
+    } catch (err) {
+      setTunnelError(err.response?.data?.detail || 'Failed to stop tunnel');
+    } finally {
+      setTunnelLoading(false);
+    }
   };
 
   if (!instance) return <div className="text-gray-400 p-8">Loading...</div>;
@@ -146,6 +175,67 @@ export default function EC2Detail() {
                       </a>
                     </div>
                   ))}
+                </div>
+              )}
+            </div>
+
+            {/* Cloudflare Tunnel */}
+            <div>
+              <h3 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wide">Cloudflare Tunnel (Public Internet)</h3>
+              {instance.state !== 'running' ? (
+                <p className="text-yellow-400 text-sm">Instance must be running to create a tunnel.</p>
+              ) : instance.tunnel_url ? (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3 bg-gray-900 rounded-lg p-3 border border-orange-500/30">
+                    <div className="flex-shrink-0 w-2 h-2 bg-orange-400 rounded-full animate-pulse" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs text-gray-500 mb-0.5">Public URL (anyone can open this)</p>
+                      <a href={instance.tunnel_url} target="_blank" rel="noreferrer"
+                        className="text-orange-400 hover:text-orange-300 text-sm font-mono break-all">
+                        {instance.tunnel_url}
+                      </a>
+                    </div>
+                    <button onClick={() => copyLink(instance.tunnel_url)}
+                      className={`px-3 py-1.5 rounded text-xs transition-colors whitespace-nowrap ${
+                        copied === instance.tunnel_url ? 'bg-green-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                      }`}>
+                      {copied === instance.tunnel_url ? 'Copied!' : 'Copy'}
+                    </button>
+                    <a href={instance.tunnel_url} target="_blank" rel="noreferrer"
+                      className="px-3 py-1.5 bg-orange-600 hover:bg-orange-700 text-white rounded text-xs whitespace-nowrap">
+                      Open
+                    </a>
+                  </div>
+                  <button onClick={stopTunnel} disabled={tunnelLoading}
+                    className="px-4 py-2 bg-red-700 hover:bg-red-600 text-white rounded text-sm disabled:opacity-50">
+                    {tunnelLoading ? 'Stopping...' : 'Stop Tunnel'}
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <p className="text-gray-400 text-sm">
+                    Generate a free <span className="text-orange-400 font-medium">trycloudflare.com</span> URL that anyone can use to visit your website — no account or domain needed.
+                  </p>
+                  <div className="flex items-start gap-3">
+                    <button onClick={startTunnel} disabled={tunnelLoading || instance.state !== 'running'}
+                      className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded text-sm font-medium disabled:opacity-50 whitespace-nowrap">
+                      {tunnelLoading ? (
+                        <span className="flex items-center gap-2">
+                          <span className="w-3 h-3 border border-white border-t-transparent rounded-full animate-spin" />
+                          Starting (~15s)...
+                        </span>
+                      ) : 'Start Cloudflare Tunnel'}
+                    </button>
+                    {!Object.keys(instance.port_mappings || {}).includes('80') && (
+                      <p className="text-yellow-400 text-xs mt-2">
+                        Tunnel requires port 80 to be mapped. Launch a new instance with port 80 exposed.
+                      </p>
+                    )}
+                  </div>
+                  {tunnelError && (
+                    <p className="text-red-400 text-sm bg-red-900/20 border border-red-700 rounded p-2">{tunnelError}</p>
+                  )}
+                  <p className="text-xs text-gray-600">Requires <code className="bg-gray-900 px-1 rounded">cloudflared</code> installed on the server.</p>
                 </div>
               )}
             </div>

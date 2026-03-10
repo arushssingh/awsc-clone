@@ -1,6 +1,9 @@
 import asyncio
 import io
 import json
+import re
+import shutil
+import subprocess
 import tarfile
 import threading
 from typing import Optional
@@ -14,6 +17,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from auth import require_permission
 from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END, SERVER_PUBLIC_IP
 from database import Instance, VPC, User, get_db, generate_id
+
+# In-memory tunnel state: instance_id → {process, url}
+_tunnels: dict[str, dict] = {}
 
 router = APIRouter(prefix="/api/v1/ec2", tags=["ec2"])
 
@@ -349,6 +355,91 @@ async def get_instance_stats(
         raise HTTPException(status_code=500, detail="Failed to get stats")
 
 
+@router.post("/instances/{instance_id}/tunnel/start")
+async def start_tunnel(
+    instance_id: str,
+    user: User = Depends(require_permission("ec2:DescribeInstances")),
+    db: AsyncSession = Depends(get_db),
+):
+    instance = await _get_instance(instance_id, db)
+    if instance.state != "running":
+        raise HTTPException(status_code=400, detail="Instance must be running")
+
+    # Stop any existing tunnel for this instance
+    if instance_id in _tunnels:
+        try:
+            _tunnels[instance_id]["process"].kill()
+        except Exception:
+            pass
+        del _tunnels[instance_id]
+
+    # Find the host port for port 80 from port_mappings
+    port_mappings = {}
+    if instance.port_mappings:
+        try:
+            port_mappings = json.loads(instance.port_mappings)
+        except json.JSONDecodeError:
+            pass
+
+    host_port = port_mappings.get("80") or port_mappings.get(80)
+    if not host_port:
+        raise HTTPException(status_code=400, detail="Instance has no port 80 mapping. Launch with port 80 exposed.")
+
+    if not shutil.which("cloudflared"):
+        raise HTTPException(status_code=500, detail="cloudflared is not installed on this server. Run: sudo dpkg -i cloudflared.deb")
+
+    def _start_and_wait():
+        proc = subprocess.Popen(
+            ["cloudflared", "tunnel", "--url", f"http://localhost:{host_port}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        url = None
+        # cloudflared prints the URL within the first ~30 lines of output
+        for _ in range(60):
+            line = proc.stdout.readline()
+            if not line:
+                break
+            m = re.search(r"https://[a-z0-9\-]+\.trycloudflare\.com", line)
+            if m:
+                url = m.group(0)
+                break
+        return proc, url
+
+    try:
+        proc, url = await asyncio.to_thread(_start_and_wait)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start tunnel: {e}")
+
+    if not url:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail="cloudflared started but could not find tunnel URL. Check that cloudflared is working.")
+
+    _tunnels[instance_id] = {"process": proc, "url": url}
+    return {"tunnel_url": url}
+
+
+@router.delete("/instances/{instance_id}/tunnel/stop")
+async def stop_tunnel(
+    instance_id: str,
+    user: User = Depends(require_permission("ec2:DescribeInstances")),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_instance(instance_id, db)
+    if instance_id not in _tunnels:
+        raise HTTPException(status_code=404, detail="No active tunnel for this instance")
+    try:
+        _tunnels[instance_id]["process"].kill()
+    except Exception:
+        pass
+    del _tunnels[instance_id]
+    return {"detail": "Tunnel stopped"}
+
+
 @router.post("/instances/{instance_id}/upload")
 async def upload_files(
     instance_id: str,
@@ -411,6 +502,8 @@ def _instance_to_dict(instance: Instance) -> dict:
         for container_port, host_port in port_mappings.items():
             public_urls[container_port] = f"http://{SERVER_PUBLIC_IP}:{host_port}"
 
+    tunnel = _tunnels.get(instance.id)
+
     return {
         "id": instance.id,
         "name": instance.name,
@@ -423,6 +516,7 @@ def _instance_to_dict(instance: Instance) -> dict:
         "private_ip": instance.private_ip,
         "port_mappings": port_mappings,
         "public_urls": public_urls,
+        "tunnel_url": tunnel["url"] if tunnel else None,
         "cpu_limit": instance.cpu_limit,
         "memory_limit": instance.memory_limit,
         "created_at": instance.created_at.isoformat(),

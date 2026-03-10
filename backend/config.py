@@ -35,4 +35,16 @@ METRICS_COLLECT_INTERVAL = int(os.getenv("METRICS_COLLECT_INTERVAL", "60"))
 METRICS_RETENTION_DAYS = int(os.getenv("METRICS_RETENTION_DAYS", "7"))
 
 # Server
-SERVER_PUBLIC_IP = os.getenv("SERVER_PUBLIC_IP", "")
+def _detect_local_ip() -> str:
+    """Auto-detect the machine's local network IP."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return ""
+
+SERVER_PUBLIC_IP = os.getenv("SERVER_PUBLIC_IP", "") or _detect_local_ip()

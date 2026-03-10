@@ -206,10 +206,17 @@ export default function EC2Detail() {
                       Open
                     </a>
                   </div>
-                  <button onClick={stopTunnel} disabled={tunnelLoading}
-                    className="px-4 py-2 bg-red-700 hover:bg-red-600 text-white rounded text-sm disabled:opacity-50">
-                    {tunnelLoading ? 'Stopping...' : 'Stop Tunnel'}
-                  </button>
+                  <div className="flex gap-2">
+                    <button onClick={startTunnel} disabled={tunnelLoading}
+                      className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded text-sm disabled:opacity-50">
+                      {tunnelLoading ? 'Generating...' : 'New URL'}
+                    </button>
+                    <button onClick={stopTunnel} disabled={tunnelLoading}
+                      className="px-4 py-2 bg-red-700 hover:bg-red-600 text-white rounded text-sm disabled:opacity-50">
+                      {tunnelLoading ? 'Stopping...' : 'Stop Tunnel'}
+                    </button>
+                  </div>
+                  <p className="text-xs text-gray-600">Cloudflare assigns random names. Click "New URL" to get a different one.</p>
                 </div>
               ) : (
                 <div className="space-y-3">

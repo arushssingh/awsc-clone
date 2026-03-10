@@ -2,8 +2,6 @@ import asyncio
 import io
 import json
 import re
-import shutil
-import subprocess
 import tarfile
 import threading
 from typing import Optional
@@ -366,12 +364,7 @@ async def start_tunnel(
         raise HTTPException(status_code=400, detail="Instance must be running")
 
     # Stop any existing tunnel for this instance
-    if instance_id in _tunnels:
-        try:
-            _tunnels[instance_id]["process"].kill()
-        except Exception:
-            pass
-        del _tunnels[instance_id]
+    _stop_tunnel_container(instance_id)
 
     # Find the host port for port 80 from port_mappings
     port_mappings = {}
@@ -385,41 +378,46 @@ async def start_tunnel(
     if not host_port:
         raise HTTPException(status_code=400, detail="Instance has no port 80 mapping. Launch with port 80 exposed.")
 
-    if not shutil.which("cloudflared"):
-        raise HTTPException(status_code=500, detail="cloudflared is not installed on this server. Run: sudo dpkg -i cloudflared.deb")
-
     def _start_and_wait():
-        proc = subprocess.Popen(
-            ["cloudflared", "tunnel", "--url", f"http://host.docker.internal:{host_port}"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
+        container_name = f"awsclone-tunnel-{instance_id}"
+        # Run cloudflared in its own container with host networking
+        # so it can reach localhost:{port} on the host
+        container = get_docker().containers.run(
+            "cloudflare/cloudflared:latest",
+            command=["tunnel", "--url", f"http://localhost:{host_port}"],
+            network_mode="host",
+            detach=True,
+            name=container_name,
+            labels={"awsclone": "true", "tunnel_for": instance_id},
+            remove=False,
         )
+        # Read logs to find the tunnel URL (takes a few seconds)
+        import time
         url = None
-        # cloudflared prints the URL within the first ~30 lines of output
-        for _ in range(60):
-            line = proc.stdout.readline()
-            if not line:
-                break
-            m = re.search(r"https://[a-z0-9\-]+\.trycloudflare\.com", line)
+        for _ in range(30):
+            time.sleep(1)
+            logs = container.logs().decode("utf-8", errors="replace")
+            m = re.search(r"https://[a-z0-9\-]+\.trycloudflare\.com", logs)
             if m:
                 url = m.group(0)
                 break
-        return proc, url
+        return container, url
 
     try:
-        proc, url = await asyncio.to_thread(_start_and_wait)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to start tunnel: {e}")
+        container, url = await asyncio.to_thread(_start_and_wait)
+    except docker.errors.ImageNotFound:
+        raise HTTPException(status_code=500, detail="Pulling cloudflared image... Try again in 30 seconds.")
+    except docker.errors.APIError as e:
+        raise HTTPException(status_code=500, detail=f"Docker error: {e.explanation}")
 
     if not url:
         try:
-            proc.kill()
+            container.remove(force=True)
         except Exception:
             pass
-        raise HTTPException(status_code=500, detail="cloudflared started but could not find tunnel URL. Check that cloudflared is working.")
+        raise HTTPException(status_code=500, detail="Tunnel started but could not get URL. Check Docker logs for awsclone-tunnel container.")
 
-    _tunnels[instance_id] = {"process": proc, "url": url}
+    _tunnels[instance_id] = {"container_id": container.id, "url": url}
     return {"tunnel_url": url}
 
 
@@ -432,12 +430,25 @@ async def stop_tunnel(
     await _get_instance(instance_id, db)
     if instance_id not in _tunnels:
         raise HTTPException(status_code=404, detail="No active tunnel for this instance")
+    _stop_tunnel_container(instance_id)
+    return {"detail": "Tunnel stopped"}
+
+
+def _stop_tunnel_container(instance_id: str):
+    """Stop and remove a tunnel container for the given instance."""
+    if instance_id in _tunnels:
+        try:
+            c = get_docker().containers.get(_tunnels[instance_id]["container_id"])
+            c.remove(force=True)
+        except Exception:
+            pass
+        del _tunnels[instance_id]
+    # Also clean up by name in case of stale containers
     try:
-        _tunnels[instance_id]["process"].kill()
+        c = get_docker().containers.get(f"awsclone-tunnel-{instance_id}")
+        c.remove(force=True)
     except Exception:
         pass
-    del _tunnels[instance_id]
-    return {"detail": "Tunnel stopped"}
 
 
 @router.post("/instances/{instance_id}/upload")

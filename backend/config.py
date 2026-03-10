@@ -35,9 +35,15 @@ METRICS_COLLECT_INTERVAL = int(os.getenv("METRICS_COLLECT_INTERVAL", "60"))
 METRICS_RETENTION_DAYS = int(os.getenv("METRICS_RETENTION_DAYS", "7"))
 
 # Server
-def _detect_local_ip() -> str:
-    """Auto-detect the machine's local network IP."""
+def _detect_host_ip() -> str:
+    """Resolve the host machine's IP from inside Docker."""
     import socket
+    try:
+        # host.docker.internal resolves to the host's IP (set via extra_hosts in docker-compose)
+        return socket.gethostbyname("host.docker.internal")
+    except Exception:
+        pass
+    # Fallback: direct socket probe
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -47,4 +53,4 @@ def _detect_local_ip() -> str:
     except Exception:
         return ""
 
-SERVER_PUBLIC_IP = os.getenv("SERVER_PUBLIC_IP", "") or _detect_local_ip()
+SERVER_PUBLIC_IP = os.getenv("SERVER_PUBLIC_IP", "") or _detect_host_ip()

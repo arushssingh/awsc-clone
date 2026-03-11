@@ -22,6 +22,7 @@ from services.cloudwatch import (
 )
 from services.iam import router as iam_router
 from services.deploy import router as deploy_router
+from services.github import router as github_router
 
 
 # ── Reconciliation daemon ─────────────────────────────────────────────────
@@ -141,6 +142,7 @@ app.include_router(route53_router)
 app.include_router(cloudwatch_router)
 app.include_router(iam_router)
 app.include_router(deploy_router)
+app.include_router(github_router)
 
 
 @app.get("/api/v1/health")

@@ -54,3 +54,9 @@ def _detect_host_ip() -> str:
         return ""
 
 SERVER_PUBLIC_IP = os.getenv("SERVER_PUBLIC_IP", "") or _detect_host_ip()
+
+# GitHub OAuth
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET", "")
+# Public base URL for OAuth callback and webhooks (e.g. http://your-server-ip)
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", f"http://{SERVER_PUBLIC_IP}" if SERVER_PUBLIC_IP else "http://localhost")

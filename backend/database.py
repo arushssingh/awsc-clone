@@ -36,6 +36,7 @@ class User(Base):
     is_root = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    github_token = Column(String, nullable=True)
 
     roles = relationship("Role", secondary="user_roles", back_populates="users")
     api_keys = relationship("ApiKey", back_populates="user", cascade="all, delete-orphan")
@@ -228,6 +229,10 @@ class Deployment(Base):
     docker_container_id = Column(String, nullable=True)
     port = Column(Integer, nullable=True)
     env_vars = Column(Text, default="{}")               # JSON
+    github_repo = Column(String, nullable=True)        # "owner/repo"
+    github_branch = Column(String, nullable=True)      # "main"
+    github_webhook_id = Column(Integer, nullable=True)
+    webhook_secret = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -258,9 +263,23 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
 # ── Database initialization ──────────────────────────────────────────────
 
 async def init_db():
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist, and migrate existing ones."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Safe migrations for existing databases
+        from sqlalchemy import text
+        migrations = [
+            "ALTER TABLE users ADD COLUMN github_token TEXT",
+            "ALTER TABLE deployments ADD COLUMN github_repo TEXT",
+            "ALTER TABLE deployments ADD COLUMN github_branch TEXT",
+            "ALTER TABLE deployments ADD COLUMN github_webhook_id INTEGER",
+            "ALTER TABLE deployments ADD COLUMN webhook_secret TEXT",
+        ]
+        for sql in migrations:
+            try:
+                await conn.execute(text(sql))
+            except Exception:
+                pass  # Column already exists
 
 
 async def get_db() -> AsyncSession:

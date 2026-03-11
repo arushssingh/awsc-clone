@@ -11,11 +11,13 @@ from pathlib import Path
 from typing import Optional
 
 import docker
+import httpx
+import secrets as _secrets
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from auth import require_permission
+from auth import require_permission, get_current_user
 from config import SERVER_PUBLIC_IP
 from database import Deployment, User, get_db, generate_id, async_session
 
@@ -555,6 +557,143 @@ async def delete_deployment(
     return {"detail": "Deployment deleted"}
 
 
+@router.post("/projects/github")
+async def deploy_from_github(
+    name: str = Form(...),
+    github_repo: str = Form(...),
+    github_branch: str = Form("main"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deploy a GitHub repository by downloading its ZIP archive."""
+    if not user.github_token:
+        raise HTTPException(status_code=400, detail="GitHub not connected")
+
+    port = _allocate_port()
+    webhook_secret = _secrets.token_hex(32)
+
+    dep = Deployment(
+        name=name,
+        owner_id=user.id,
+        status="uploading",
+        port=port,
+        github_repo=github_repo,
+        github_branch=github_branch,
+        webhook_secret=webhook_secret,
+    )
+    db.add(dep)
+    await db.flush()
+    deploy_id = dep.id
+
+    project_dir = DEPLOYS_DIR / deploy_id
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    # Download repo as ZIP from GitHub API
+    try:
+        zip_bytes = await _download_github_zip(user.github_token, github_repo, github_branch)
+    except Exception as e:
+        dep.status = "failed"
+        dep.build_log = f"Failed to download repository: {e}"
+        await db.flush()
+        raise HTTPException(status_code=500, detail=f"Failed to download repo: {e}")
+
+    _extract_zip(zip_bytes, project_dir)
+
+    # Register GitHub webhook
+    webhook_id = await _register_github_webhook(user.github_token, github_repo, webhook_secret)
+    if webhook_id:
+        dep.github_webhook_id = webhook_id
+    await db.flush()
+
+    # Start background build
+    info = _detect_project(project_dir)
+    asyncio.create_task(_build_and_deploy(deploy_id, project_dir, info))
+    return _deploy_to_dict(dep)
+
+
+async def _download_github_zip(token: str, repo: str, branch: str) -> bytes:
+    """Download repository ZIP from GitHub API."""
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.get(
+            f"https://api.github.com/repos/{repo}/zipball/{branch}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            timeout=120,
+        )
+        if resp.status_code == 404:
+            raise Exception(f"Repository or branch not found: {repo}@{branch}")
+        if resp.status_code != 200:
+            raise Exception(f"GitHub API error {resp.status_code}")
+        return resp.content
+
+
+async def _register_github_webhook(token: str, repo: str, secret: str) -> int | None:
+    """Create a push webhook on the GitHub repo. Returns webhook ID or None."""
+    from config import PUBLIC_BASE_URL
+    webhook_url = f"{PUBLIC_BASE_URL}/api/v1/github/webhook"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://api.github.com/repos/{repo}/hooks",
+                json={
+                    "name": "web",
+                    "active": True,
+                    "events": ["push"],
+                    "config": {
+                        "url": webhook_url,
+                        "content_type": "json",
+                        "secret": secret,
+                        "insecure_ssl": "0",
+                    },
+                },
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+                timeout=15,
+            )
+            if resp.status_code == 201:
+                return resp.json().get("id")
+    except Exception:
+        pass
+    return None
+
+
+async def github_redeploy(deploy_id: str):
+    """Re-download from GitHub and rebuild. Called by webhook handler."""
+    async with async_session() as db:
+        result = await db.execute(select(Deployment).where(Deployment.id == deploy_id))
+        dep = result.scalar_one_or_none()
+        if not dep or not dep.github_repo:
+            return
+
+        # Get owner's GitHub token
+        result2 = await db.execute(select(User).where(User.id == dep.owner_id))
+        owner = result2.scalar_one_or_none()
+        if not owner or not owner.github_token:
+            return
+
+        dep.status = "uploading"
+        dep.build_log = "Auto-redeploy triggered by GitHub push...\n"
+        await db.commit()
+
+    project_dir = DEPLOYS_DIR / deploy_id
+    shutil.rmtree(project_dir, ignore_errors=True)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        zip_bytes = await _download_github_zip(owner.github_token, dep.github_repo, dep.github_branch or "main")
+    except Exception as e:
+        async with async_session() as db:
+            result = await db.execute(select(Deployment).where(Deployment.id == deploy_id))
+            dep2 = result.scalar_one_or_none()
+            if dep2:
+                dep2.status = "failed"
+                dep2.build_log = f"Failed to download for redeploy: {e}"
+                await db.commit()
+        return
+
+    _extract_zip(zip_bytes, project_dir)
+    info = _detect_project(project_dir)
+    await _build_and_deploy(deploy_id, project_dir, info)
+
+
 # ── Tunnel ───────────────────────────────────────────────────────────
 
 _deploy_tunnels: dict[str, dict] = {}  # deploy_id → {container_id, url}
@@ -668,6 +807,9 @@ def _deploy_to_dict(dep: Deployment) -> dict:
         "port": dep.port,
         "url": url,
         "tunnel_url": tunnel["url"] if tunnel else None,
+        "github_repo": dep.github_repo,
+        "github_branch": dep.github_branch,
+        "github_webhook_id": dep.github_webhook_id,
         "created_at": dep.created_at.isoformat() if dep.created_at else None,
         "updated_at": dep.updated_at.isoformat() if dep.updated_at else None,
     }

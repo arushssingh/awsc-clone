@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import api from '../api';
 
@@ -8,12 +8,6 @@ export default function EC2Detail() {
   const [instance, setInstance] = useState(null);
   const [logs, setLogs] = useState('');
   const [tab, setTab] = useState('overview');
-
-  // Upload state
-  const [uploading, setUploading] = useState(false);
-  const [uploadMsg, setUploadMsg] = useState(null);
-  const [dragOver, setDragOver] = useState(false);
-  const fileInputRef = useRef(null);
 
   // Copy link feedback
   const [copied, setCopied] = useState(null);
@@ -42,26 +36,6 @@ export default function EC2Detail() {
     }
   }, [tab, id, instance]);
 
-  const handleUpload = async (fileList) => {
-    if (!fileList || fileList.length === 0) return;
-    setUploading(true);
-    setUploadMsg(null);
-    const formData = new FormData();
-    for (const file of fileList) {
-      formData.append('files', file);
-    }
-    try {
-      const res = await api.post(`/ec2/instances/${id}/upload`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
-      setUploadMsg({ ok: true, text: res.data.detail });
-    } catch (err) {
-      setUploadMsg({ ok: false, text: err.response?.data?.detail || 'Upload failed' });
-    } finally {
-      setUploading(false);
-    }
-  };
-
   const copyLink = (url) => {
     navigator.clipboard.writeText(url);
     setCopied(url);
@@ -73,7 +47,7 @@ export default function EC2Detail() {
     setTunnelError(null);
     try {
       await api.post(`/ec2/instances/${id}/tunnel/start`);
-      await fetchInstance(); // refresh to get tunnel_url
+      await fetchInstance();
     } catch (err) {
       setTunnelError(err.response?.data?.detail || 'Failed to start tunnel');
     } finally {
@@ -216,12 +190,11 @@ export default function EC2Detail() {
                       {tunnelLoading ? 'Stopping...' : 'Stop Tunnel'}
                     </button>
                   </div>
-                  <p className="text-xs text-gray-600">Cloudflare assigns random names. Click "New URL" to get a different one.</p>
                 </div>
               ) : (
                 <div className="space-y-3">
                   <p className="text-gray-400 text-sm">
-                    Generate a free <span className="text-orange-400 font-medium">trycloudflare.com</span> URL that anyone can use to visit your website — no account or domain needed.
+                    Generate a free <span className="text-orange-400 font-medium">trycloudflare.com</span> URL that anyone can use to visit your website.
                   </p>
                   <div className="flex items-start gap-3">
                     <button onClick={startTunnel} disabled={tunnelLoading || instance.state !== 'running'}
@@ -235,74 +208,14 @@ export default function EC2Detail() {
                     </button>
                     {!Object.keys(instance.port_mappings || {}).includes('80') && (
                       <p className="text-yellow-400 text-xs mt-2">
-                        Tunnel requires port 80 to be mapped. Launch a new instance with port 80 exposed.
+                        Tunnel requires port 80 to be mapped.
                       </p>
                     )}
                   </div>
                   {tunnelError && (
                     <p className="text-red-400 text-sm bg-red-900/20 border border-red-700 rounded p-2">{tunnelError}</p>
                   )}
-                  <p className="text-xs text-gray-600">Requires <code className="bg-gray-900 px-1 rounded">cloudflared</code> installed on the server.</p>
                 </div>
-              )}
-            </div>
-
-            {/* File Upload */}
-            <div>
-              <h3 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wide">Upload Website Files</h3>
-              {instance.state !== 'running' ? (
-                <p className="text-yellow-400 text-sm">Instance must be running to upload files.</p>
-              ) : (
-                <>
-                  <div
-                    onDragOver={e => { e.preventDefault(); setDragOver(true); }}
-                    onDragLeave={() => setDragOver(false)}
-                    onDrop={e => {
-                      e.preventDefault();
-                      setDragOver(false);
-                      handleUpload(e.dataTransfer.files);
-                    }}
-                    onClick={() => fileInputRef.current?.click()}
-                    className={`border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-colors ${
-                      dragOver ? 'border-blue-400 bg-blue-900/20' : 'border-gray-600 hover:border-gray-400'
-                    }`}
-                  >
-                    <input
-                      ref={fileInputRef}
-                      type="file"
-                      multiple
-                      className="hidden"
-                      onChange={e => handleUpload(e.target.files)}
-                    />
-                    {uploading ? (
-                      <div className="text-blue-400">
-                        <div className="animate-spin w-8 h-8 border-2 border-blue-400 border-t-transparent rounded-full mx-auto mb-2" />
-                        Uploading...
-                      </div>
-                    ) : (
-                      <>
-                        <p className="text-gray-300 text-sm font-medium">Drop files here or click to select</p>
-                        <p className="text-gray-500 text-xs mt-1">HTML, CSS, JavaScript, images — select multiple files at once</p>
-                      </>
-                    )}
-                  </div>
-
-                  {uploadMsg && (
-                    <div className={`mt-3 p-3 rounded text-sm ${
-                      uploadMsg.ok ? 'bg-green-900/30 border border-green-700 text-green-300' : 'bg-red-900/30 border border-red-700 text-red-300'
-                    }`}>
-                      {uploadMsg.text}
-                      {uploadMsg.ok && publicUrls.length > 0 && (
-                        <span> — <a href={publicUrls[0][1]} target="_blank" rel="noreferrer" className="underline">View your site</a></span>
-                      )}
-                    </div>
-                  )}
-
-                  <p className="text-xs text-gray-500 mt-3">
-                    Files are uploaded to <code className="bg-gray-900 px-1 rounded">/usr/share/nginx/html/</code> inside the container.
-                    Make sure your main file is named <code className="bg-gray-900 px-1 rounded">index.html</code>.
-                  </p>
-                </>
               )}
             </div>
           </div>

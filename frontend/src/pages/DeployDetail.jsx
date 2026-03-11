@@ -20,14 +20,21 @@ export default function DeployDetail() {
   const [tab, setTab] = useState('overview');
   const [actionLoading, setActionLoading] = useState('');
   const [tunnelLoading, setTunnelLoading] = useState(false);
+  const [files, setFiles] = useState([]);
+  const [filesLoading, setFilesLoading] = useState(false);
   const logEndRef = useRef(null);
 
   const fetchDep = () => api.get(`/deploy/projects/${id}`).then(r => setDep(r.data)).catch(() => {});
   const fetchLogs = () => api.get(`/deploy/projects/${id}/logs`).then(r => setLogs(r.data)).catch(() => {});
+  const fetchFiles = () => {
+    setFilesLoading(true);
+    api.get(`/deploy/projects/${id}/files`).then(r => setFiles(r.data)).catch(() => {}).finally(() => setFilesLoading(false));
+  };
 
   useEffect(() => {
     fetchDep();
     fetchLogs();
+    fetchFiles();
     const interval = setInterval(() => { fetchDep(); fetchLogs(); }, 4000);
     return () => clearInterval(interval);
   }, [id]);
@@ -173,10 +180,10 @@ export default function DeployDetail() {
 
       {/* Tabs */}
       <div className="flex gap-1 mb-4 border-b border-gray-700">
-        {['overview', 'build-log', 'runtime-log'].map(t => (
-          <button key={t} onClick={() => setTab(t)}
+        {['overview', 'files', 'build-log', 'runtime-log'].map(t => (
+          <button key={t} onClick={() => { setTab(t); if (t === 'files') fetchFiles(); }}
             className={`px-4 py-2 text-sm transition-colors ${tab === t ? 'text-blue-400 border-b-2 border-blue-400' : 'text-gray-400 hover:text-white'}`}>
-            {t === 'overview' ? 'Overview' : t === 'build-log' ? 'Build Log' : 'Runtime Log'}
+            {t === 'overview' ? 'Overview' : t === 'files' ? 'Files' : t === 'build-log' ? 'Build Log' : 'Runtime Log'}
           </button>
         ))}
       </div>
@@ -223,6 +230,39 @@ export default function DeployDetail() {
           ))}
           </div>
         </>
+      )}
+
+      {/* Files Tab */}
+      {tab === 'files' && (
+        <div className="bg-gray-900 rounded-lg overflow-hidden">
+          {filesLoading ? (
+            <div className="text-gray-500 text-center py-8 text-sm">Loading files...</div>
+          ) : files.length === 0 ? (
+            <div className="text-gray-500 text-center py-8 text-sm">No project files found.</div>
+          ) : (
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-gray-700">
+                  <th className="text-left px-4 py-2 text-xs font-medium text-gray-500">File</th>
+                  <th className="text-right px-4 py-2 text-xs font-medium text-gray-500 w-24">Size</th>
+                </tr>
+              </thead>
+              <tbody>
+                {files.map(f => (
+                  <tr key={f.path} className="border-b border-gray-800 hover:bg-gray-800/50">
+                    <td className="px-4 py-1.5 text-sm text-gray-300 font-mono">{f.path}</td>
+                    <td className="px-4 py-1.5 text-xs text-gray-500 text-right">
+                      {f.size < 1024 ? `${f.size} B` : f.size < 1048576 ? `${(f.size / 1024).toFixed(1)} KB` : `${(f.size / 1048576).toFixed(1)} MB`}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {files.length >= 500 && (
+            <p className="text-xs text-gray-600 text-center py-2">Showing first 500 files</p>
+          )}
+        </div>
       )}
 
       {/* Build Log Tab */}

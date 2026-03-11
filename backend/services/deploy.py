@@ -521,6 +521,30 @@ async def start_deployment(
     return _deploy_to_dict(dep)
 
 
+@router.get("/projects/{deploy_id}/files")
+async def list_deploy_files(
+    deploy_id: str,
+    user: User = Depends(require_permission("ec2:DescribeInstances")),
+    db: AsyncSession = Depends(get_db),
+):
+    dep = await _get_deploy(deploy_id, db)
+    project_dir = DEPLOYS_DIR / dep.id
+    if not project_dir.exists():
+        return []
+
+    skip = {'node_modules', '.git', '__pycache__', '.next', 'dist', 'build', '.cache', 'venv', '.venv'}
+    files = []
+    for path in sorted(project_dir.rglob("*")):
+        if any(part in skip for part in path.relative_to(project_dir).parts):
+            continue
+        if path.is_file():
+            rel = str(path.relative_to(project_dir))
+            files.append({"path": rel, "size": path.stat().st_size})
+            if len(files) >= 500:
+                break
+    return files
+
+
 @router.delete("/projects/{deploy_id}")
 async def delete_deployment(
     deploy_id: str,

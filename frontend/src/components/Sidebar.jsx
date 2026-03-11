@@ -8,7 +8,6 @@ import {
   HiOutlineChartBar,
   HiOutlineShieldCheck,
   HiOutlineSquares2X2,
-  HiOutlineRocketLaunch,
 } from 'react-icons/hi2';
 
 const navGroups = [
@@ -23,7 +22,6 @@ const navGroups = [
     items: [
       { name: 'EC2', path: '/ec2', icon: HiOutlineServer },
       { name: 'Lambda', path: '/lambda', icon: HiOutlineBolt },
-      { name: 'Deploy', path: '/deploy', icon: HiOutlineRocketLaunch },
     ],
   },
   {

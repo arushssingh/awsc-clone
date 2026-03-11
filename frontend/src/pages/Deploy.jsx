@@ -133,7 +133,7 @@ export default function Deploy() {
             <div key={dep.id} className="bg-gray-800 rounded-lg p-4 hover:bg-gray-800/80 transition-colors">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-3">
-                  <Link to={`/deploy/${dep.id}`} className="text-white font-medium hover:text-blue-400 transition-colors">
+                  <Link to={`/ec2/deploy/${dep.id}`} className="text-white font-medium hover:text-blue-400 transition-colors">
                     {dep.name}
                   </Link>
                   <span className={`px-2 py-0.5 rounded text-xs font-medium ${STATUS_COLORS[dep.status] || 'bg-gray-500/20 text-gray-400'}`}>
@@ -149,7 +149,7 @@ export default function Deploy() {
                     <a href={dep.url} target="_blank" rel="noreferrer"
                       className="text-xs text-blue-400 hover:text-blue-300 font-mono">{dep.url}</a>
                   )}
-                  <Link to={`/deploy/${dep.id}`} className="text-gray-400 hover:text-white text-xs">Details</Link>
+                  <Link to={`/ec2/deploy/${dep.id}`} className="text-gray-400 hover:text-white text-xs">Details</Link>
                   <button onClick={() => deleteDeployment(dep.id)} className="text-red-400 hover:text-red-300 text-xs">Delete</button>
                 </div>
               </div>

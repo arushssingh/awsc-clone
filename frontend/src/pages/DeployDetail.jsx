@@ -82,7 +82,7 @@ export default function DeployDetail() {
   return (
     <div>
       <div className="flex items-center gap-2 text-sm text-gray-400 mb-4">
-        <Link to="/deploy" className="hover:text-white">Deploy</Link>
+        <Link to="/ec2" className="hover:text-white">EC2</Link>
         <span>/</span>
         <span className="text-white">{dep.name}</span>
       </div>

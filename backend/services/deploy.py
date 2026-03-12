@@ -741,7 +741,7 @@ async def start_deploy_tunnel(
         import time
         container = _get_docker().containers.run(
             "cloudflare/cloudflared:latest",
-            command=["tunnel", "--url", f"http://localhost:{dep.port}"],
+            command=["tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{dep.port}"],
             network_mode="host",
             detach=True,
             name=f"awsclone-deploy-tunnel-{deploy_id}",

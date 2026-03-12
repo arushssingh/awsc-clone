@@ -384,7 +384,7 @@ async def start_tunnel(
         # so it can reach localhost:{port} on the host
         container = get_docker().containers.run(
             "cloudflare/cloudflared:latest",
-            command=["tunnel", "--url", f"http://localhost:{host_port}"],
+            command=["tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{host_port}"],
             network_mode="host",
             detach=True,
             name=container_name,

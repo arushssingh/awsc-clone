@@ -36,22 +36,28 @@ METRICS_RETENTION_DAYS = int(os.getenv("METRICS_RETENTION_DAYS", "7"))
 
 # Server
 def _detect_host_ip() -> str:
-    """Resolve the host machine's IP from inside Docker."""
+    """Detect the host machine's real LAN IP (not Docker bridge)."""
     import socket
-    try:
-        # host.docker.internal resolves to the host's IP (set via extra_hosts in docker-compose)
-        return socket.gethostbyname("host.docker.internal")
-    except Exception:
-        pass
-    # Fallback: direct socket probe
+    # Prefer socket probe — connects to 8.8.8.8 without sending data,
+    # revealing which outbound interface is used (gives real LAN IP like 192.168.x.x)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        # Reject Docker bridge IPs (172.x.x.x or 10.x.x.x virtual ranges)
+        if not ip.startswith("172.") and not ip.startswith("10."):
+            return ip
     except Exception:
-        return ""
+        pass
+    # Fallback: host.docker.internal (works if extra_hosts: host-gateway is set)
+    try:
+        ip = socket.gethostbyname("host.docker.internal")
+        if not ip.startswith("172.") and not ip.startswith("10."):
+            return ip
+    except Exception:
+        pass
+    return ""
 
 SERVER_PUBLIC_IP = os.getenv("SERVER_PUBLIC_IP", "") or _detect_host_ip()
 

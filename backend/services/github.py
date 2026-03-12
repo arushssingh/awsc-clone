@@ -76,7 +76,7 @@ async def github_auth_callback(
     user.github_token = access_token
     await db.flush()
 
-    return RedirectResponse(url="/?github=connected")
+    return RedirectResponse(url="/ec2?github=connected")
 
 
 @router.get("/status")

@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import require_permission, get_current_user
-from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END, SERVER_PUBLIC_IP
+from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END, SERVER_PUBLIC_IP, CADDY_ADMIN_URL
 from database import Instance, VPC, User, get_db, generate_id, async_session
 
 # Reuse project detection and Dockerfile generation from deploy service
@@ -504,6 +504,7 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
                     labels={"awsclone": "true", "instance_id": instance_id},
                     mem_limit="512m",
                     restart_policy={"Name": "unless-stopped"},
+                    network="awsclone-internal",
                 )
                 container.reload()
                 return container
@@ -516,7 +517,16 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
                 return
 
             log(f"[deploy] Container started: {container.short_id}")
-            log(f"[deploy] URL: http://{SERVER_PUBLIC_IP or 'localhost'}:{host_port}")
+
+            # Add Caddy reverse proxy route so the app is accessible via port 80
+            try:
+                await _add_caddy_route_ec2(instance_id, container_name, container_port)
+                log(f"[deploy] Caddy route added: /instance/{instance_id}/")
+            except Exception as e:
+                log(f"[deploy] Warning: Could not add Caddy route: {e}")
+
+            deploy_url = f"http://{SERVER_PUBLIC_IP or 'localhost'}/instance/{instance_id}/"
+            log(f"[deploy] URL: {deploy_url}")
             log("[deploy] Deployment successful!")
 
             # Extract private IP
@@ -898,6 +908,41 @@ async def _get_instance(instance_id: str, db: AsyncSession) -> Instance:
     return instance
 
 
+async def _add_caddy_route_ec2(instance_id: str, container_name: str, container_port: int):
+    """Add a reverse proxy route in Caddy for an EC2 instance."""
+    route_id = f"instance-{instance_id}"
+    route_config = {
+        "@id": route_id,
+        "match": [{"path": [f"/instance/{instance_id}/*"]}],
+        "handle": [
+            {
+                "handler": "rewrite",
+                "strip_path_prefix": f"/instance/{instance_id}",
+            },
+            {
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": f"{container_name}:{container_port}"}],
+            },
+        ],
+    }
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"{CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes",
+            json=route_config,
+            timeout=10,
+        )
+
+
+async def _remove_caddy_route_ec2(instance_id: str):
+    """Remove a Caddy route for an EC2 instance."""
+    route_id = f"instance-{instance_id}"
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.delete(f"{CADDY_ADMIN_URL}/id/{route_id}", timeout=10)
+        except Exception:
+            pass
+
+
 def _instance_to_dict(instance: Instance) -> dict:
     port_mappings = None
     if instance.port_mappings:
@@ -910,6 +955,11 @@ def _instance_to_dict(instance: Instance) -> dict:
     if port_mappings and SERVER_PUBLIC_IP:
         for container_port, host_port in port_mappings.items():
             public_urls[container_port] = f"http://{SERVER_PUBLIC_IP}:{host_port}"
+
+    # If this instance was built from source (has project_type), provide Caddy-proxied URL
+    instance_url = None
+    if instance.project_type and SERVER_PUBLIC_IP:
+        instance_url = f"http://{SERVER_PUBLIC_IP}/instance/{instance.id}/"
 
     tunnel = _tunnels.get(instance.id)
 
@@ -925,6 +975,7 @@ def _instance_to_dict(instance: Instance) -> dict:
         "private_ip": instance.private_ip,
         "port_mappings": port_mappings,
         "public_urls": public_urls,
+        "instance_url": instance_url,
         "tunnel_url": tunnel["url"] if tunnel else None,
         "cpu_limit": instance.cpu_limit,
         "memory_limit": instance.memory_limit,

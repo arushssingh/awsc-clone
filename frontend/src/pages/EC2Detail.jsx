@@ -292,14 +292,31 @@ export default function EC2Detail() {
           <div className="space-y-6">
             <div>
               <h3 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wide">Shareable Links</h3>
-              {publicUrls.length === 0 ? (
+              {instance.instance_url && (
+                <div className="flex items-center gap-3 bg-gray-900 rounded-lg p-3 mb-2 border border-green-700/30">
+                  <div className="flex-1">
+                    <p className="text-xs text-green-500 mb-0.5">Website URL</p>
+                    <a href={instance.instance_url} target="_blank" rel="noreferrer"
+                      className="text-green-400 hover:text-green-300 text-sm font-mono break-all">{instance.instance_url}</a>
+                  </div>
+                  <button onClick={() => copyLink(instance.instance_url)}
+                    className={`px-3 py-1.5 rounded text-xs whitespace-nowrap ${
+                      copied === instance.instance_url ? 'bg-green-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'
+                    }`}>
+                    {copied === instance.instance_url ? 'Copied!' : 'Copy'}
+                  </button>
+                  <a href={instance.instance_url} target="_blank" rel="noreferrer"
+                    className="px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded text-xs whitespace-nowrap">Open</a>
+                </div>
+              )}
+              {publicUrls.length === 0 && !instance.instance_url ? (
                 <p className="text-gray-500 text-sm">No ports exposed.</p>
-              ) : (
+              ) : publicUrls.length > 0 && (
                 <div className="space-y-2">
                   {publicUrls.map(([port, url]) => (
                     <div key={port} className="flex items-center gap-3 bg-gray-900 rounded-lg p-3">
                       <div className="flex-1">
-                        <p className="text-xs text-gray-500 mb-0.5">Port {port}</p>
+                        <p className="text-xs text-gray-500 mb-0.5">Port {port} (direct)</p>
                         <a href={url} target="_blank" rel="noreferrer"
                           className="text-blue-400 hover:text-blue-300 text-sm font-mono break-all">{url}</a>
                       </div>

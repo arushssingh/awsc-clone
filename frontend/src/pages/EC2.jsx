@@ -9,8 +9,6 @@ const STATE_COLORS = {
   stopping: 'bg-yellow-500/20 text-yellow-400',
   stopped: 'bg-red-500/20 text-red-400',
   terminated: 'bg-gray-500/20 text-gray-400',
-  uploading: 'bg-yellow-500/20 text-yellow-400',
-  queued: 'bg-yellow-500/20 text-yellow-400',
   building: 'bg-blue-500/20 text-blue-400',
   failed: 'bg-red-500/20 text-red-400',
 };
@@ -24,17 +22,10 @@ export default function EC2() {
   const [searchParams, setSearchParams] = useSearchParams();
 
   const [instances, setInstances] = useState([]);
-  const [deployments, setDeployments] = useState([]);
   const [loading, setLoading] = useState(true);
 
   const fetchAll = () => {
-    Promise.all([
-      api.get('/ec2/instances').then(r => r.data).catch(() => []),
-      api.get('/deploy/projects').then(r => r.data).catch(() => []),
-    ]).then(([inst, dep]) => {
-      setInstances(inst);
-      setDeployments(dep);
-    }).finally(() => setLoading(false));
+    api.get('/ec2/instances').then(r => setInstances(r.data)).catch(() => []).finally(() => setLoading(false));
   };
 
   // Launch modal
@@ -72,12 +63,6 @@ export default function EC2() {
     } catch (err) { toast.error(err.response?.data?.detail || `Failed to ${act}`); }
   };
 
-  const deleteDeployment = async (id) => {
-    if (!confirm('Delete this deployment?')) return;
-    try { await api.delete(`/deploy/projects/${id}`); fetchAll(); }
-    catch (err) { toast.error(err.response?.data?.detail || 'Delete failed'); }
-  };
-
   useEffect(() => {
     fetchAll();
     if (searchParams.get('github') === 'connected') {
@@ -87,11 +72,6 @@ export default function EC2() {
     const interval = setInterval(fetchAll, 5000);
     return () => clearInterval(interval);
   }, []);
-
-  const allItems = [
-    ...instances.map(i => ({ ...i, _kind: 'instance', _time: i.created_at })),
-    ...deployments.map(d => ({ ...d, _kind: 'deploy', _time: d.created_at, state: d.status })),
-  ].sort((a, b) => new Date(b._time) - new Date(a._time));
 
   return (
     <div>
@@ -147,10 +127,10 @@ export default function EC2() {
         </div>
       )}
 
-      {/* Unified List */}
+      {/* Instance List */}
       {loading ? (
         <div className="text-gray-500 text-center py-8">Loading...</div>
-      ) : allItems.length === 0 ? (
+      ) : instances.length === 0 ? (
         <div className="bg-gray-800 rounded-lg p-12 text-center">
           <p className="text-gray-400 mb-2">No instances yet</p>
           <p className="text-gray-500 text-sm">Launch a Docker container, then deploy code from GitHub or upload a ZIP</p>
@@ -161,27 +141,39 @@ export default function EC2() {
             <thead>
               <tr className="border-b border-gray-700">
                 <th className="text-left px-4 py-3 text-sm font-medium text-gray-400">Name</th>
-                <th className="text-left px-4 py-3 text-sm font-medium text-gray-400">Type</th>
                 <th className="text-left px-4 py-3 text-sm font-medium text-gray-400">State</th>
                 <th className="text-left px-4 py-3 text-sm font-medium text-gray-400">Source</th>
+                <th className="text-left px-4 py-3 text-sm font-medium text-gray-400">Type</th>
                 <th className="text-left px-4 py-3 text-sm font-medium text-gray-400">Actions</th>
               </tr>
             </thead>
             <tbody>
-              {allItems.map(item => item._kind === 'instance' ? (
-                <tr key={`i-${item.id}`} className="border-b border-gray-700/50 hover:bg-gray-700/30">
+              {instances.map(item => (
+                <tr key={item.id} className="border-b border-gray-700/50 hover:bg-gray-700/30">
                   <td className="px-4 py-3 text-sm">
                     <Link to={`/ec2/${item.id}`} className="text-blue-400 hover:underline">{item.name}</Link>
                   </td>
                   <td className="px-4 py-3 text-sm">
-                    <span className="text-xs bg-gray-700 text-gray-300 px-2 py-0.5 rounded">Docker</span>
-                  </td>
-                  <td className="px-4 py-3 text-sm">
                     <span className={`px-2 py-0.5 rounded text-xs font-medium ${STATE_COLORS[item.state] || 'text-gray-400'}`}>
+                      {item.state === 'building' && <span className="inline-block w-2 h-2 bg-blue-400 rounded-full animate-pulse mr-1" />}
                       {item.state}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-sm text-gray-400 font-mono text-xs">{item.image}</td>
+                  <td className="px-4 py-3 text-sm text-gray-400 text-xs">
+                    {item.github_repo ? (
+                      <span className="flex items-center gap-1">
+                        {GH_ICON('w-3 h-3 text-gray-500')}
+                        <span className="font-mono">{item.github_repo}</span>
+                      </span>
+                    ) : item.project_label ? (
+                      <span className="text-purple-300">{item.project_label}</span>
+                    ) : (
+                      <span className="font-mono">{item.image}</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-sm">
+                    <span className="text-xs bg-gray-700 text-gray-300 px-2 py-0.5 rounded">{item.instance_type}</span>
+                  </td>
                   <td className="px-4 py-3 text-sm space-x-2">
                     {item.state === 'stopped' && (
                       <button onClick={() => instanceAction(item.id, 'start')} className="text-green-400 hover:text-green-300 text-xs">Start</button>
@@ -196,40 +188,6 @@ export default function EC2() {
                       <button onClick={() => { if (confirm('Terminate?')) instanceAction(item.id, 'terminate'); }}
                         className="text-red-400 hover:text-red-300 text-xs">Terminate</button>
                     )}
-                  </td>
-                </tr>
-              ) : (
-                <tr key={`d-${item.id}`} className="border-b border-gray-700/50 hover:bg-gray-700/30">
-                  <td className="px-4 py-3 text-sm">
-                    <Link to={`/ec2/deploy/${item.id}`} className="text-blue-400 hover:underline">{item.name}</Link>
-                  </td>
-                  <td className="px-4 py-3 text-sm">
-                    <span className="text-xs bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded">
-                      {item.project_label || 'Deploy'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-sm">
-                    <span className={`px-2 py-0.5 rounded text-xs font-medium ${STATE_COLORS[item.state] || 'text-gray-400'}`}>
-                      {item.state === 'building' && <span className="inline-block w-2 h-2 bg-blue-400 rounded-full animate-pulse mr-1" />}
-                      {item.state}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-sm text-gray-400 text-xs">
-                    {item.github_repo ? (
-                      <span className="flex items-center gap-1">
-                        {GH_ICON('w-3 h-3 text-gray-500')}
-                        <span className="font-mono">{item.github_repo}</span>
-                      </span>
-                    ) : (
-                      <span className="text-gray-500">ZIP upload</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-3 text-sm space-x-2">
-                    {item.url && item.state === 'running' && (
-                      <a href={item.url} target="_blank" rel="noreferrer" className="text-green-400 hover:text-green-300 text-xs">Open</a>
-                    )}
-                    <Link to={`/ec2/deploy/${item.id}`} className="text-gray-400 hover:text-white text-xs">Details</Link>
-                    <button onClick={() => deleteDeployment(item.id)} className="text-red-400 hover:text-red-300 text-xs">Delete</button>
                   </td>
                 </tr>
               ))}

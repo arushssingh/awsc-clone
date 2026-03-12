@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import get_current_user, require_permission
 from config import GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, PUBLIC_BASE_URL
-from database import Deployment, User, async_session, get_db
+from database import Deployment, Instance, User, async_session, get_db
 
 router = APIRouter(prefix="/api/v1/github", tags=["github"])
 
@@ -188,33 +188,52 @@ async def github_webhook(request: Request):
     if not repo_full_name or not branch:
         return {"detail": "no repo/branch"}
 
+    import asyncio
+    redeployed = []
+
     async with async_session() as db:
+        # Check Deployments table
         result = await db.execute(
             select(Deployment).where(
                 Deployment.github_repo == repo_full_name,
                 Deployment.github_branch == branch,
             )
         )
-        deps = result.scalars().all()
-
-        import asyncio
-        redeployed = []
-        for dep in deps:
+        for dep in result.scalars().all():
             if dep.webhook_secret and sig_header:
                 expected = "sha256=" + hmac.new(
                     dep.webhook_secret.encode(), body, hashlib.sha256
                 ).hexdigest()
                 if not hmac.compare_digest(sig_header, expected):
                     continue
+            asyncio.create_task(_trigger_deploy_redeploy(dep.id))
+            redeployed.append(f"deploy:{dep.id}")
 
-            dep_id = dep.id
-            asyncio.create_task(_trigger_redeploy(dep_id))
-            redeployed.append(dep_id)
+        # Check Instances table (code deployed into instance)
+        result2 = await db.execute(
+            select(Instance).where(
+                Instance.github_repo == repo_full_name,
+                Instance.github_branch == branch,
+            )
+        )
+        for inst in result2.scalars().all():
+            if inst.webhook_secret and sig_header:
+                expected = "sha256=" + hmac.new(
+                    inst.webhook_secret.encode(), body, hashlib.sha256
+                ).hexdigest()
+                if not hmac.compare_digest(sig_header, expected):
+                    continue
+            asyncio.create_task(_trigger_instance_redeploy(inst.id))
+            redeployed.append(f"instance:{inst.id}")
 
     return {"redeployed": redeployed}
 
 
-async def _trigger_redeploy(deploy_id: str):
-    """Background task to redeploy a GitHub deployment."""
+async def _trigger_deploy_redeploy(deploy_id: str):
     from services.deploy import github_redeploy
     await github_redeploy(deploy_id)
+
+
+async def _trigger_instance_redeploy(instance_id: str):
+    from services.ec2 import instance_github_redeploy
+    await instance_github_redeploy(instance_id)

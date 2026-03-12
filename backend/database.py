@@ -113,6 +113,15 @@ class Instance(Base):
     memory_limit = Column(Integer, default=256)  # MB
     environment = Column(Text, default="{}")  # JSON
     command = Column(String, nullable=True)
+    # Deploy fields (GitHub/ZIP code deploy into this instance)
+    github_repo = Column(String, nullable=True)        # "owner/repo"
+    github_branch = Column(String, nullable=True)
+    github_webhook_id = Column(Integer, nullable=True)
+    webhook_secret = Column(String, nullable=True)
+    project_type = Column(String, nullable=True)       # static, vite, nextjs, python, etc.
+    project_label = Column(String, nullable=True)       # Human-readable
+    build_log = Column(Text, nullable=True)
+    docker_image_tag = Column(String, nullable=True)    # built image tag
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -274,6 +283,15 @@ async def init_db():
             "ALTER TABLE deployments ADD COLUMN github_branch TEXT",
             "ALTER TABLE deployments ADD COLUMN github_webhook_id INTEGER",
             "ALTER TABLE deployments ADD COLUMN webhook_secret TEXT",
+            # Instance deploy fields
+            "ALTER TABLE instances ADD COLUMN github_repo TEXT",
+            "ALTER TABLE instances ADD COLUMN github_branch TEXT",
+            "ALTER TABLE instances ADD COLUMN github_webhook_id INTEGER",
+            "ALTER TABLE instances ADD COLUMN webhook_secret TEXT",
+            "ALTER TABLE instances ADD COLUMN project_type TEXT",
+            "ALTER TABLE instances ADD COLUMN project_label TEXT",
+            "ALTER TABLE instances ADD COLUMN build_log TEXT",
+            "ALTER TABLE instances ADD COLUMN docker_image_tag TEXT",
         ]
         for sql in migrations:
             try:

@@ -3,6 +3,8 @@
 }
 
 :80 {
+	# Deploy routes are added dynamically via Caddy admin API
+
 	handle /api/* {
 		reverse_proxy backend:8000
 	}

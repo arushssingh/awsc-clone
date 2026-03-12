@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import require_permission, get_current_user
-from config import SERVER_PUBLIC_IP
+from config import SERVER_PUBLIC_IP, CADDY_ADMIN_URL
 from database import Deployment, User, get_db, generate_id, async_session
 
 router = APIRouter(prefix="/api/v1/deploy", tags=["deploy"])
@@ -275,6 +275,7 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
                     labels={"awsclone": "true", "deploy_id": deploy_id},
                     mem_limit="256m",
                     restart_policy={"Name": "unless-stopped"},
+                    network="awsclone-internal",
                 )
                 container.reload()
                 return container
@@ -287,7 +288,16 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
                 return
 
             log(f"[deploy] Container started: {container.short_id}")
-            log(f"[deploy] URL: http://{SERVER_PUBLIC_IP or 'localhost'}:{host_port}")
+
+            # Add Caddy reverse proxy route so the app is accessible via port 80
+            try:
+                await _add_caddy_route(deploy_id, container_name, container_port)
+                log(f"[deploy] Caddy route added: /deploy/{deploy_id}/")
+            except Exception as e:
+                log(f"[deploy] Warning: Could not add Caddy route: {e}")
+
+            deploy_url = f"http://{SERVER_PUBLIC_IP or 'localhost'}/deploy/{deploy_id}/"
+            log(f"[deploy] URL: {deploy_url}")
             log("[deploy] Deployment successful!")
 
             # Save final state
@@ -307,6 +317,53 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
         except Exception as e:
             log(f"[error] Unexpected: {e}")
             await _save_status("failed")
+
+
+# ── Caddy route management ───────────────────────────────────────────
+
+async def _add_caddy_route(deploy_id: str, container_name: str, container_port: int):
+    """Add a reverse proxy route in Caddy so the deploy is accessible via /deploy/{id}/."""
+    route_id = f"deploy-{deploy_id}"
+    route_config = {
+        "@id": route_id,
+        "match": [{"path": [f"/deploy/{deploy_id}/*"]}],
+        "handle": [
+            {
+                "handler": "rewrite",
+                "strip_path_prefix": f"/deploy/{deploy_id}",
+            },
+            {
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": f"{container_name}:{container_port}"}],
+            },
+        ],
+    }
+    async with httpx.AsyncClient() as client:
+        # Prepend route so it's matched before the catch-all file_server
+        resp = await client.post(
+            f"{CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes",
+            json=route_config,
+            timeout=10,
+        )
+        # If srv0 doesn't exist, try without server name (Caddyfile auto-names it)
+        if resp.status_code >= 400:
+            resp = await client.post(
+                f"{CADDY_ADMIN_URL}/config/apps/http/servers",
+                timeout=10,
+            )
+
+
+async def _remove_caddy_route(deploy_id: str):
+    """Remove a Caddy route for a deployment."""
+    route_id = f"deploy-{deploy_id}"
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.delete(
+                f"{CADDY_ADMIN_URL}/id/{route_id}",
+                timeout=10,
+            )
+        except Exception:
+            pass
 
 
 # ── Extract ZIP with folder normalization ────────────────────────────
@@ -552,6 +609,9 @@ async def delete_deployment(
     db: AsyncSession = Depends(get_db),
 ):
     dep = await _get_deploy(deploy_id, db)
+
+    # Remove Caddy route
+    await _remove_caddy_route(deploy_id)
 
     # Remove container
     if dep.docker_container_id:
@@ -817,7 +877,7 @@ async def _get_deploy(deploy_id: str, db: AsyncSession) -> Deployment:
 def _deploy_to_dict(dep: Deployment) -> dict:
     url = None
     if dep.port and SERVER_PUBLIC_IP:
-        url = f"http://{SERVER_PUBLIC_IP}:{dep.port}"
+        url = f"http://{SERVER_PUBLIC_IP}/deploy/{dep.id}/"
 
     tunnel = _deploy_tunnels.get(dep.id)
 

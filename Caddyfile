@@ -1,29 +1,25 @@
 {
 	admin 0.0.0.0:2019
-	# Disable automatic HTTPS since we're using DuckDNS (no wildcard TLS without DNS challenge)
+	# Disable auto-HTTPS — we handle SSL termination at the edge (Cloudflare or manually)
 	auto_https off
 }
 
-# Main dashboard on the base domain
+# Handle ALL incoming requests on port 80
+# Caddy matches routes in order — subdomain routes are prepended dynamically via admin API
+# The base domain and unmatched subdomains fall through to the handlers below
 :80 {
-	@basedomain host cloudfabric.duckdns.org
-	handle @basedomain {
-		handle /api/* {
-			reverse_proxy backend:8000
-		}
+	# ── Dynamic subdomain routes are inserted HERE via admin API ──
+	# Example injected route (added by backend when user sets subdomain):
+	# { "match": [{"host": ["myapp.1.2.3.4.sslip.io"]}], "handle": [...reverse_proxy...] }
 
-		handle {
-			root * /srv/frontend
-			try_files {path} /index.html
-			file_server
-		}
+	# ── Dashboard: serve frontend on base domain or direct IP ──
+	handle /api/* {
+		reverse_proxy backend:8000
 	}
 
-	# Subdomain routes are added dynamically via Caddy admin API
-	# They match on specific Host headers like mysite.cloudfabric.duckdns.org
-
-	# Fallback for unrecognized subdomains
 	handle {
-		respond "This site hasn't been deployed yet." 404
+		root * /srv/frontend
+		try_files {path} /index.html
+		file_server
 	}
 }

@@ -61,8 +61,22 @@ def _detect_host_ip() -> str:
 
 SERVER_PUBLIC_IP = os.getenv("SERVER_PUBLIC_IP", "") or _detect_host_ip()
 
-# Base domain for custom subdomains (e.g. mysite.cloudfabric.duckdns.org)
-BASE_DOMAIN = os.getenv("BASE_DOMAIN", "cloudfabric.duckdns.org")
+# Base domain for custom subdomain URLs.
+# - Set to your real wildcard-capable domain (e.g. yourdomain.com)
+# - OR leave blank to auto-use sslip.io (e.g. myapp.1.2.3.4.sslip.io) — zero DNS config needed
+_base_domain_env = os.getenv("BASE_DOMAIN", "")
+
+
+def _get_base_domain() -> str:
+    if _base_domain_env:
+        return _base_domain_env
+    # sslip.io fallback: myapp.SERVER_IP.sslip.io resolves automatically
+    if SERVER_PUBLIC_IP:
+        return f"{SERVER_PUBLIC_IP}.sslip.io"
+    return ""
+
+
+BASE_DOMAIN = _get_base_domain()
 
 # GitHub OAuth
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")

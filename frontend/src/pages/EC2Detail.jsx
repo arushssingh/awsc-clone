@@ -28,6 +28,7 @@ export default function EC2Detail() {
   // Subdomain
   const [subdomainInput, setSubdomainInput] = useState('');
   const [subdomainSaving, setSubdomainSaving] = useState(false);
+  const [baseDomain, setBaseDomain] = useState('...');
 
   // GitHub
   const [githubStatus, setGithubStatus] = useState({ connected: false, login: null });
@@ -120,6 +121,10 @@ export default function EC2Detail() {
       toast.error(err.response?.data?.detail || 'Failed to set subdomain');
     } finally { setSubdomainSaving(false); }
   };
+
+  useEffect(() => {
+    api.get('/config').then(res => setBaseDomain(res.data.base_domain)).catch(() => {});
+  }, []);
 
   useEffect(() => {
     fetchInstance();
@@ -270,7 +275,7 @@ export default function EC2Detail() {
                   <div className="flex items-center gap-2">
                     <input value={subdomainInput} onChange={e => setSubdomainInput(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
                       placeholder="new-name" className="flex-1 px-3 py-1.5 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-blue-500 font-mono" />
-                    <span className="text-gray-500 text-sm">.cloudfabric.duckdns.org</span>
+                    <span className="text-gray-500 text-sm">.{baseDomain}</span>
                     <button onClick={saveSubdomain} disabled={subdomainSaving || subdomainInput === instance.subdomain}
                       className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs disabled:opacity-50 whitespace-nowrap">
                       {subdomainSaving ? 'Saving...' : 'Update'}
@@ -283,7 +288,7 @@ export default function EC2Detail() {
                   <div className="flex items-center gap-2">
                     <input value={subdomainInput} onChange={e => setSubdomainInput(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
                       placeholder="my-website" className="flex-1 px-3 py-2 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-blue-500 font-mono" />
-                    <span className="text-gray-500 text-sm">.cloudfabric.duckdns.org</span>
+                    <span className="text-gray-500 text-sm">.{baseDomain}</span>
                     <button onClick={saveSubdomain} disabled={subdomainSaving || !subdomainInput.trim()}
                       className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-medium disabled:opacity-50 whitespace-nowrap">
                       {subdomainSaving ? 'Saving...' : 'Set URL'}

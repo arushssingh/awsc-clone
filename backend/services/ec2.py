@@ -734,6 +734,25 @@ async def set_subdomain(
     return _instance_to_dict(instance)
 
 
+async def restore_subdomain_routes():
+    """Called on startup — re-registers all active subdomain Caddy routes from the DB."""
+    async with async_session() as db:
+        result = await db.execute(
+            select(Instance).where(
+                Instance.subdomain.isnot(None),
+                Instance.state == "running",
+            )
+        )
+        for inst in result.scalars().all():
+            container_name = f"awsclone-{inst.id}"
+            is_static = inst.project_type in ("static", "vite", "cra", "vue", "angular", "svelte", "node-static")
+            container_port = 80 if is_static else 3000
+            try:
+                await _add_caddy_subdomain_route(inst.subdomain, container_name, container_port)
+            except Exception:
+                pass
+
+
 async def _add_caddy_subdomain_route(subdomain: str, container_name: str, container_port: int):
     """Add a Caddy route that matches subdomain.BASE_DOMAIN and proxies to the container."""
     route_id = f"subdomain-{subdomain}"

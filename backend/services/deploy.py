@@ -130,6 +130,7 @@ RUN npm install
 COPY . .
 RUN npm run build
 EXPOSE 3000
+ENV HOSTNAME=0.0.0.0
 CMD ["npm", "start"]"""
 
     if t == "node-server":
@@ -139,6 +140,8 @@ COPY package*.json ./
 RUN npm install --production
 COPY . .
 EXPOSE 3000
+ENV HOST=0.0.0.0
+ENV HOSTNAME=0.0.0.0
 CMD ["npm", "start"]"""
 
     if t == "python":
@@ -156,6 +159,8 @@ CMD ["npm", "start"]"""
         if "fastapi" in reqs or "uvicorn" in reqs:
             module = entry[:-3]
             cmd = f'CMD ["uvicorn", "{module}:app", "--host", "0.0.0.0", "--port", "{port}"]'
+        elif "flask" in reqs:
+            cmd = f'ENV FLASK_APP={entry}\nENV FLASK_RUN_HOST=0.0.0.0\nENV FLASK_RUN_PORT={port}\nCMD ["flask", "run"]'
         elif "django" in reqs:
             cmd = f'CMD ["python", "manage.py", "runserver", "0.0.0.0:{port}"]'
         else:
@@ -271,7 +276,7 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
                     image_tag,
                     detach=True,
                     name=container_name,
-                    ports={f"{container_port}/tcp": host_port},
+                    ports={f"{container_port}/tcp": ("0.0.0.0", host_port)},
                     labels={"awsclone": "true", "deploy_id": deploy_id},
                     mem_limit="256m",
                     restart_policy={"Name": "unless-stopped"},
@@ -288,6 +293,25 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
                 return
 
             log(f"[deploy] Container started: {container.short_id}")
+
+            # Verify container is still running after startup (catches immediate crashes)
+            await asyncio.sleep(2)
+
+            def _check_running():
+                container.reload()
+                return container.status, container.logs(tail=50).decode("utf-8", errors="replace")
+
+            try:
+                container_status, startup_logs = await asyncio.to_thread(_check_running)
+                if startup_logs.strip():
+                    log(f"[deploy] Container startup logs:\n{startup_logs.rstrip()}")
+                if container_status != "running":
+                    log(f"[deploy] Container exited (status={container_status}). App may be crashing or binding to wrong host/port.")
+                    await _save_status("failed")
+                    return
+                log(f"[deploy] Container verified running (docker ps status={container_status})")
+            except Exception as e:
+                log(f"[deploy] Warning: could not verify container status: {e}")
 
             # Add Caddy reverse proxy route so the app is accessible via port 80
             try:
@@ -794,6 +818,22 @@ async def start_deploy_tunnel(
         raise HTTPException(status_code=400, detail="Deployment must be running")
     if not dep.port:
         raise HTTPException(status_code=400, detail="Deployment has no port assigned")
+
+    # Verify the deployment container is actually running before starting tunnel
+    if dep.docker_container_id:
+        def _verify_container():
+            try:
+                c = _get_docker().containers.get(dep.docker_container_id)
+                c.reload()
+                return c.status
+            except docker.errors.NotFound:
+                return "not_found"
+        container_status = await asyncio.to_thread(_verify_container)
+        if container_status != "running":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Deployment container is not running (status={container_status}). Check logs for errors."
+            )
 
     _stop_deploy_tunnel(deploy_id)
 

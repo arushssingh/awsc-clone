@@ -79,8 +79,14 @@ def _detect_project(project_dir: Path) -> dict:
                 return {"type": "vue", "label": "Vue", "output": "dist"}
             return {"type": "node-static", "label": "Node.js (static)", "output": "dist"}
 
-        if "start" in scripts or "main" in pkg:
+        # Only classify as node-server if there are actual server dependencies
+        server_deps = {"express", "fastify", "koa", "hapi", "@hapi/hapi", "http-server", "serve", "next", "nuxt"}
+        if ("start" in scripts or "main" in pkg) and (server_deps & set(deps.keys())):
             return {"type": "node-server", "label": "Node.js Server", "port": 3000}
+
+        # Has package.json but no build script and no server deps — check for index.html
+        if any((project_dir / f).exists() for f in ["index.html", "index.htm"]):
+            return {"type": "static", "label": "Static HTML"}
 
     if (project_dir / "requirements.txt").exists():
         reqs = (project_dir / "requirements.txt").read_text().lower()

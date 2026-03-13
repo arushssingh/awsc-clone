@@ -165,7 +165,6 @@ export default function EC2Detail() {
 
   if (!instance) return <div className="text-gray-400 p-8">Loading...</div>;
 
-  const publicUrls = Object.entries(instance.public_urls || {});
   const allTabs = ['overview', 'website', 'logs'];
   const tabLabels = { overview: 'Overview', website: 'Website', logs: 'Runtime Log' };
   const INPUT = "w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-blue-500";
@@ -251,58 +250,42 @@ export default function EC2Detail() {
               </div>
             )}
 
-            {/* Shareable Links */}
+            {/* Shareable Link (Cloudflare Tunnel only) */}
             <div>
-              <h3 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wide">Shareable Links</h3>
+              <h3 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wide">Shareable Link</h3>
 
-              {instance.instance_url ? (
-                <div className="space-y-2">
-                  <div className="flex items-center gap-3 bg-gray-900 rounded-lg p-3 border border-green-700/30">
-                    <div className="flex-1">
-                      <p className="text-xs text-green-500 mb-0.5">Website URL</p>
-                      <a href={instance.instance_url} target="_blank" rel="noreferrer"
-                        className="text-green-400 hover:text-green-300 text-sm font-mono break-all">{instance.instance_url}</a>
-                    </div>
-                    <button onClick={() => copyLink(instance.instance_url)}
-                      className={`px-3 py-1.5 rounded text-xs whitespace-nowrap ${copied === instance.instance_url ? 'bg-green-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
-                      {copied === instance.instance_url ? 'Copied!' : 'Copy'}
-                    </button>
-                    <a href={instance.instance_url} target="_blank" rel="noreferrer"
-                      className="px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded text-xs whitespace-nowrap">Open</a>
+              {instance.tunnel_url ? (
+                <div className="flex items-center gap-3 bg-gray-900 rounded-lg p-3 border border-green-700/30">
+                  <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-xs text-green-500 mb-0.5">Live Website</p>
+                    <a href={instance.tunnel_url} target="_blank" rel="noreferrer"
+                      className="text-green-400 hover:text-green-300 text-sm font-mono break-all">{instance.tunnel_url}</a>
                   </div>
-                  {publicUrls.map(([port, url]) => (
-                    <div key={port} className="flex items-center gap-3 bg-gray-900 rounded-lg p-3">
-                      <div className="flex-1">
-                        <p className="text-xs text-gray-500 mb-0.5">Port {port} (direct)</p>
-                        <a href={url} target="_blank" rel="noreferrer"
-                          className="text-blue-400 hover:text-blue-300 text-sm font-mono break-all">{url}</a>
-                      </div>
-                      <button onClick={() => copyLink(url)}
-                        className={`px-3 py-1.5 rounded text-xs whitespace-nowrap ${copied === url ? 'bg-green-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
-                        {copied === url ? 'Copied!' : 'Copy'}
-                      </button>
-                      <a href={url} target="_blank" rel="noreferrer"
-                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs whitespace-nowrap">Open</a>
-                    </div>
-                  ))}
+                  <button onClick={() => copyLink(instance.tunnel_url)}
+                    className={`px-3 py-1.5 rounded text-xs whitespace-nowrap ${copied === instance.tunnel_url ? 'bg-green-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
+                    {copied === instance.tunnel_url ? 'Copied!' : 'Copy'}
+                  </button>
+                  <a href={instance.tunnel_url} target="_blank" rel="noreferrer"
+                    className="px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded text-xs whitespace-nowrap">Open</a>
                 </div>
-              ) : publicUrls.length > 0 ? (
-                <div className="space-y-2">
-                  {publicUrls.map(([port, url]) => (
-                    <div key={port} className="flex items-center gap-3 bg-gray-900 rounded-lg p-3">
-                      <div className="flex-1">
-                        <p className="text-xs text-gray-500 mb-0.5">Port {port} (direct)</p>
-                        <a href={url} target="_blank" rel="noreferrer"
-                          className="text-blue-400 hover:text-blue-300 text-sm font-mono break-all">{url}</a>
-                      </div>
-                      <button onClick={() => copyLink(url)}
-                        className={`px-3 py-1.5 rounded text-xs whitespace-nowrap ${copied === url ? 'bg-green-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
-                        {copied === url ? 'Copied!' : 'Copy'}
-                      </button>
-                      <a href={url} target="_blank" rel="noreferrer"
-                        className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs whitespace-nowrap">Open</a>
-                    </div>
-                  ))}
+              ) : instance.state === 'running' && instance.github_repo ? (
+                <div className="space-y-3">
+                  <p className="text-gray-400 text-sm">
+                    Your website is deployed. Start a Cloudflare Tunnel to get a shareable link.
+                  </p>
+                  <button onClick={startTunnel} disabled={tunnelLoading}
+                    className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded text-sm font-medium disabled:opacity-50">
+                    {tunnelLoading ? (
+                      <span className="flex items-center gap-2">
+                        <span className="w-3 h-3 border border-white border-t-transparent rounded-full animate-spin" />
+                        Starting (~15s)...
+                      </span>
+                    ) : 'Generate Shareable Link'}
+                  </button>
+                  {tunnelError && (
+                    <p className="text-red-400 text-sm bg-red-900/20 border border-red-700 rounded p-2">{tunnelError}</p>
+                  )}
                 </div>
               ) : instance.state !== 'building' && (
                 <p className="text-gray-500 text-sm">No website deployed yet. Connect GitHub below to deploy one.</p>
@@ -407,56 +390,20 @@ export default function EC2Detail() {
               )}
             </div>
 
-            {/* Cloudflare Tunnel */}
-            <div>
-              <h3 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wide">Cloudflare Tunnel</h3>
-              {instance.state !== 'running' ? (
-                <p className="text-yellow-400 text-sm">Instance must be running to start a tunnel.</p>
-              ) : instance.tunnel_url ? (
-                <div className="space-y-3">
-                  <div className="flex items-center gap-3 bg-gray-900 rounded-lg p-3 border border-orange-500/30">
-                    <div className="w-2 h-2 bg-orange-400 rounded-full animate-pulse" />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs text-gray-500 mb-0.5">Public URL</p>
-                      <a href={instance.tunnel_url} target="_blank" rel="noreferrer"
-                        className="text-orange-400 hover:text-orange-300 text-sm font-mono break-all">{instance.tunnel_url}</a>
-                    </div>
-                    <button onClick={() => copyLink(instance.tunnel_url)}
-                      className={`px-3 py-1.5 rounded text-xs whitespace-nowrap ${copied === instance.tunnel_url ? 'bg-green-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
-                      {copied === instance.tunnel_url ? 'Copied!' : 'Copy'}
-                    </button>
-                    <a href={instance.tunnel_url} target="_blank" rel="noreferrer"
-                      className="px-3 py-1.5 bg-orange-600 hover:bg-orange-700 text-white rounded text-xs whitespace-nowrap">Open</a>
-                  </div>
-                  <div className="flex gap-2">
-                    <button onClick={startTunnel} disabled={tunnelLoading}
-                      className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded text-sm disabled:opacity-50">
-                      {tunnelLoading ? 'Generating...' : 'New URL'}
-                    </button>
-                    <button onClick={stopTunnel} disabled={tunnelLoading}
-                      className="px-4 py-2 bg-red-700 hover:bg-red-600 text-white rounded text-sm disabled:opacity-50">Stop Tunnel</button>
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  <p className="text-gray-400 text-sm">
-                    Generate a free <span className="text-orange-400 font-medium">trycloudflare.com</span> URL — shareable with anyone.
-                  </p>
+            {/* Tunnel Controls */}
+            {instance.tunnel_url && (
+              <div>
+                <h3 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wide">Tunnel Controls</h3>
+                <div className="flex gap-2">
                   <button onClick={startTunnel} disabled={tunnelLoading}
-                    className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded text-sm font-medium disabled:opacity-50">
-                    {tunnelLoading ? (
-                      <span className="flex items-center gap-2">
-                        <span className="w-3 h-3 border border-white border-t-transparent rounded-full animate-spin" />
-                        Starting (~15s)...
-                      </span>
-                    ) : 'Start Cloudflare Tunnel'}
+                    className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded text-sm disabled:opacity-50">
+                    {tunnelLoading ? 'Generating...' : 'New URL'}
                   </button>
-                  {tunnelError && (
-                    <p className="text-red-400 text-sm bg-red-900/20 border border-red-700 rounded p-2">{tunnelError}</p>
-                  )}
+                  <button onClick={stopTunnel} disabled={tunnelLoading}
+                    className="px-4 py-2 bg-red-700 hover:bg-red-600 text-white rounded text-sm disabled:opacity-50">Stop Tunnel</button>
                 </div>
-              )}
-            </div>
+              </div>
+            )}
 
           </div>
         )}

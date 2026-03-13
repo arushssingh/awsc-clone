@@ -877,15 +877,7 @@ def _instance_to_dict(instance: Instance) -> dict:
         except json.JSONDecodeError:
             port_mappings = {}
 
-    public_urls = {}
-    if port_mappings and SERVER_PUBLIC_IP:
-        for container_port, host_port in port_mappings.items():
-            public_urls[container_port] = f"http://{SERVER_PUBLIC_IP}:{host_port}"
-
-    instance_url = None
-    if instance.project_type and SERVER_PUBLIC_IP:
-        instance_url = f"http://{SERVER_PUBLIC_IP}/instance/{instance.id}/"
-
+    # No direct IP:port links — deployed websites are only accessible via Cloudflare tunnel
     tunnel = _tunnels.get(instance.id)
 
     return {
@@ -899,8 +891,8 @@ def _instance_to_dict(instance: Instance) -> dict:
         "vpc_id": instance.vpc_id,
         "private_ip": instance.private_ip,
         "port_mappings": port_mappings,
-        "public_urls": public_urls,
-        "instance_url": instance_url,
+        "public_urls": {},
+        "instance_url": None,
         "tunnel_url": tunnel["url"] if tunnel else None,
         "cpu_limit": instance.cpu_limit,
         "memory_limit": instance.memory_limit,

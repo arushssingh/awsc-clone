@@ -11,25 +11,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import get_current_user, require_permission
 from config import GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, PUBLIC_BASE_URL
-from database import Deployment, User, async_session, get_db
+from database import Deployment, Instance, User, async_session, get_db
 
 router = APIRouter(prefix="/api/v1/github", tags=["github"])
 
-# state → user_id (short-lived, cleared after use)
-_oauth_states: dict[str, str] = {}
+# state → {user_id, instance_id} (short-lived, cleared after use)
+_oauth_states: dict[str, dict] = {}
 
 
 # ── OAuth ─────────────────────────────────────────────────────────────────
 
 @router.get("/auth/url")
-async def github_auth_url(user: User = Depends(get_current_user)):
+async def github_auth_url(
+    instance_id: str | None = None,
+    user: User = Depends(get_current_user),
+):
     if not GITHUB_CLIENT_ID:
         raise HTTPException(
             status_code=500,
             detail="GitHub OAuth not configured. Add GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET to .env",
         )
     state = secrets.token_urlsafe(32)
-    _oauth_states[state] = user.id
+    # store user_id and optional instance_id so callback can redirect back
+    _oauth_states[state] = {"user_id": user.id, "instance_id": instance_id}
     redirect_uri = f"{PUBLIC_BASE_URL}/api/v1/github/auth/callback"
     url = (
         f"https://github.com/login/oauth/authorize"
@@ -47,9 +51,11 @@ async def github_auth_callback(
     state: str,
     db: AsyncSession = Depends(get_db),
 ):
-    user_id = _oauth_states.pop(state, None)
-    if not user_id:
+    state_data = _oauth_states.pop(state, None)
+    if not state_data:
         raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
+    user_id = state_data["user_id"]
+    instance_id = state_data.get("instance_id")
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -76,6 +82,8 @@ async def github_auth_callback(
     user.github_token = access_token
     await db.flush()
 
+    if instance_id:
+        return RedirectResponse(url=f"/ec2/instances/{instance_id}?github=connected")
     return RedirectResponse(url="/ec2?github=connected")
 
 
@@ -209,9 +217,31 @@ async def github_webhook(request: Request):
             asyncio.create_task(_trigger_deploy_redeploy(dep.id))
             redeployed.append(f"deploy:{dep.id}")
 
+        # Check Instances with a GitHub website deployed
+        result2 = await db.execute(
+            select(Instance).where(
+                Instance.github_repo == repo_full_name,
+                Instance.github_branch == branch,
+            )
+        )
+        for inst in result2.scalars().all():
+            if inst.webhook_secret and sig_header:
+                expected = "sha256=" + hmac.new(
+                    inst.webhook_secret.encode(), body, hashlib.sha256
+                ).hexdigest()
+                if not hmac.compare_digest(sig_header, expected):
+                    continue
+            asyncio.create_task(_trigger_instance_redeploy(inst.id))
+            redeployed.append(f"instance:{inst.id}")
+
     return {"redeployed": redeployed}
 
 
 async def _trigger_deploy_redeploy(deploy_id: str):
     from services.deploy import github_redeploy
     await github_redeploy(deploy_id)
+
+
+async def _trigger_instance_redeploy(instance_id: str):
+    from services.ec2 import instance_github_redeploy
+    await instance_github_redeploy(instance_id)

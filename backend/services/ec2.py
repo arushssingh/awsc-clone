@@ -2,23 +2,31 @@ import asyncio
 import io
 import json
 import re
+import secrets as _secrets
+import shutil
 import tarfile
 import threading
 from pathlib import Path
 from typing import Optional
 
 import docker
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import require_permission, get_current_user
-from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END, SERVER_PUBLIC_IP
+from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END, SERVER_PUBLIC_IP, CADDY_ADMIN_URL
 from database import Instance, VPC, User, get_db, generate_id, async_session
+from services.deploy import _detect_project, _generate_dockerfile, _extract_zip
 
 # In-memory tunnel state: instance_id → {container_id, url}
 _tunnels: dict[str, dict] = {}
+
+# Project source files stored here
+INSTANCE_PROJECTS_DIR = Path("/app/data/instance_projects")
+INSTANCE_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
 router = APIRouter(prefix="/api/v1/ec2", tags=["ec2"])
 
@@ -289,6 +297,22 @@ async def terminate_instance(
         except docker.errors.APIError as e:
             raise HTTPException(status_code=500, detail=f"Docker error: {e.explanation}")
 
+    # Clean up built image and project files
+    if instance.docker_image_tag:
+        try:
+            await asyncio.to_thread(
+                lambda: get_docker().images.remove(instance.docker_image_tag, force=True)
+            )
+        except Exception:
+            pass
+    project_dir = INSTANCE_PROJECTS_DIR / instance.id
+    if project_dir.exists():
+        shutil.rmtree(project_dir, ignore_errors=True)
+
+    # Remove Caddy route if one was added
+    if instance.project_type:
+        await _remove_caddy_route_ec2(instance.id)
+
     # Stop tunnel
     _stop_tunnel_container(instance.id)
 
@@ -353,6 +377,335 @@ async def get_instance_stats(
         raise HTTPException(status_code=404, detail="Container not found")
     except docker.errors.APIError:
         raise HTTPException(status_code=500, detail="Failed to get stats")
+
+
+# ── GitHub deploy into instance ──────────────────────────────────────────
+
+_build_semaphore = asyncio.Semaphore(1)
+
+
+async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
+    """Build Docker image from source and replace the instance's container."""
+    log_lines = []
+
+    def log(msg: str):
+        log_lines.append(msg)
+
+    async def _save(state: str = None):
+        async with async_session() as db:
+            result = await db.execute(select(Instance).where(Instance.id == instance_id))
+            inst = result.scalar_one_or_none()
+            if inst:
+                inst.build_log = "\n".join(log_lines)
+                inst.project_type = info["type"]
+                inst.project_label = info["label"]
+                if state:
+                    inst.state = state
+                await db.commit()
+
+    async with _build_semaphore:
+        try:
+            await _save("building")
+            log(f"[detect] Project type: {info['label']} ({info['type']})")
+
+            dockerfile_content = _generate_dockerfile(info, project_dir)
+            if dockerfile_content is not None:
+                (project_dir / "Dockerfile").write_text(dockerfile_content)
+                log("[build] Generated Dockerfile")
+            else:
+                log("[build] Using existing Dockerfile")
+
+            is_static = info["type"] in ("static", "vite", "cra", "vue", "angular", "svelte", "node-static")
+            container_port = 80 if is_static else info.get("port", 3000)
+
+            image_tag = f"awsclone-instance-{instance_id}"
+            log(f"[build] Building image: {image_tag} ...")
+
+            def _docker_build():
+                client = get_docker()
+                image, build_logs = client.images.build(
+                    path=str(project_dir), tag=image_tag, rm=True, forcerm=True,
+                )
+                return image, build_logs
+
+            try:
+                image, build_logs = await asyncio.to_thread(_docker_build)
+                for chunk in build_logs:
+                    if "stream" in chunk:
+                        line = chunk["stream"].strip()
+                        if line:
+                            log(f"  {line}")
+                    if "error" in chunk:
+                        log(f"  ERROR: {chunk['error']}")
+                        raise Exception(chunk["error"])
+            except docker.errors.BuildError as e:
+                log(f"[build] FAILED: {e}")
+                for item in e.build_log:
+                    if "stream" in item:
+                        log(f"  {item['stream'].strip()}")
+                    if "error" in item:
+                        log(f"  ERROR: {item['error']}")
+                await _save("failed")
+                return
+            except Exception as e:
+                log(f"[build] FAILED: {e}")
+                await _save("failed")
+                return
+
+            log("[build] Image built successfully")
+
+            async with async_session() as db:
+                result = await db.execute(select(Instance).where(Instance.id == instance_id))
+                inst = result.scalar_one_or_none()
+                if not inst:
+                    return
+                port_mappings = {}
+                if inst.port_mappings:
+                    try:
+                        port_mappings = json.loads(inst.port_mappings)
+                    except json.JSONDecodeError:
+                        pass
+                host_port = port_mappings.get(str(container_port)) or port_mappings.get(container_port) or _allocate_port()
+                old_container_id = inst.docker_container_id
+
+            container_name = f"awsclone-{instance_id}"
+            log(f"[deploy] Starting container on port {host_port} ...")
+
+            def _replace_container():
+                client = get_docker()
+                if old_container_id:
+                    try:
+                        client.containers.get(old_container_id).remove(force=True)
+                    except docker.errors.NotFound:
+                        pass
+                try:
+                    client.containers.get(container_name).remove(force=True)
+                except docker.errors.NotFound:
+                    pass
+                container = client.containers.run(
+                    image_tag,
+                    detach=True,
+                    name=container_name,
+                    ports={f"{container_port}/tcp": ("0.0.0.0", host_port)},
+                    labels={"awsclone": "true", "instance_id": instance_id},
+                    mem_limit="512m",
+                    restart_policy={"Name": "unless-stopped"},
+                    network="awsclone-internal",
+                )
+                container.reload()
+                return container
+
+            try:
+                container = await asyncio.to_thread(_replace_container)
+            except Exception as e:
+                log(f"[deploy] FAILED to start container: {e}")
+                await _save("failed")
+                return
+
+            log(f"[deploy] Container started: {container.short_id}")
+
+            # Verify container stays running (catches crash-loops)
+            await asyncio.sleep(5)
+
+            def _check_running():
+                container.reload()
+                return container.status, container.logs(tail=50).decode("utf-8", errors="replace")
+
+            try:
+                container_status, startup_logs = await asyncio.to_thread(_check_running)
+                if startup_logs.strip():
+                    log(f"[deploy] Container startup logs:\n{startup_logs.rstrip()}")
+                if container_status == "restarting":
+                    log("[deploy] Container is crash-looping. Common causes: missing env vars/database, app binds to 127.0.0.1 internally.")
+                    await _save("failed")
+                    return
+                if container_status != "running":
+                    log(f"[deploy] Container exited (status={container_status}). Check startup logs above.")
+                    await _save("failed")
+                    return
+                log(f"[deploy] Container verified running (status={container_status})")
+            except Exception as e:
+                log(f"[deploy] Warning: could not verify container status: {e}")
+
+            # Add Caddy route so app is reachable at /instance/{id}/
+            try:
+                await _add_caddy_route_ec2(instance_id, container_name, container_port)
+                log(f"[deploy] Caddy route added: /instance/{instance_id}/")
+            except Exception as e:
+                log(f"[deploy] Warning: Could not add Caddy route: {e}")
+
+            deploy_url = f"http://{SERVER_PUBLIC_IP or 'localhost'}/instance/{instance_id}/"
+            log(f"[deploy] Website URL: {deploy_url}")
+            log("[deploy] Deployment successful!")
+
+            private_ip = None
+            try:
+                for net_info in container.attrs["NetworkSettings"]["Networks"].values():
+                    if net_info.get("IPAddress"):
+                        private_ip = net_info["IPAddress"]
+                        break
+            except Exception:
+                pass
+
+            async with async_session() as db:
+                result = await db.execute(select(Instance).where(Instance.id == instance_id))
+                inst = result.scalar_one_or_none()
+                if inst:
+                    inst.state = "running"
+                    inst.build_log = "\n".join(log_lines)
+                    inst.docker_container_id = container.id
+                    inst.docker_image_tag = image_tag
+                    inst.image = image_tag
+                    inst.project_type = info["type"]
+                    inst.project_label = info["label"]
+                    inst.port_mappings = json.dumps({str(container_port): host_port})
+                    inst.private_ip = private_ip
+                    await db.commit()
+
+        except Exception as e:
+            log(f"[error] Unexpected: {e}")
+            await _save("failed")
+
+
+@router.post("/instances/{instance_id}/deploy/github")
+async def deploy_github_to_instance(
+    instance_id: str,
+    github_repo: str = Form(...),
+    github_branch: str = Form("main"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deploy a GitHub repo as the website for this instance."""
+    instance = await _get_instance(instance_id, db)
+    if not user.github_token:
+        raise HTTPException(status_code=400, detail="GitHub not connected")
+
+    webhook_secret = _secrets.token_hex(32)
+    instance.github_repo = github_repo
+    instance.github_branch = github_branch
+    instance.webhook_secret = webhook_secret
+    instance.state = "building"
+    instance.build_log = "Starting GitHub deploy..."
+    await db.flush()
+
+    project_dir = INSTANCE_PROJECTS_DIR / instance_id
+    if project_dir.exists():
+        shutil.rmtree(project_dir, ignore_errors=True)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        zip_bytes = await _download_github_zip(user.github_token, github_repo, github_branch)
+    except Exception as e:
+        instance.state = "failed"
+        instance.build_log = f"Failed to download repository: {e}"
+        await db.flush()
+        raise HTTPException(status_code=500, detail=f"Failed to download repo: {e}")
+
+    _extract_zip(zip_bytes, project_dir)
+
+    webhook_id = await _register_github_webhook(user.github_token, github_repo, webhook_secret)
+    if webhook_id:
+        instance.github_webhook_id = webhook_id
+    await db.flush()
+
+    info = _detect_project(project_dir)
+    asyncio.create_task(_build_and_replace(instance_id, project_dir, info))
+    return _instance_to_dict(instance)
+
+
+async def instance_github_redeploy(instance_id: str):
+    """Re-download from GitHub and rebuild. Called by webhook handler."""
+    async with async_session() as db:
+        result = await db.execute(select(Instance).where(Instance.id == instance_id))
+        inst = result.scalar_one_or_none()
+        if not inst or not inst.github_repo:
+            return
+        result2 = await db.execute(select(User).where(User.id == inst.owner_id))
+        owner = result2.scalar_one_or_none()
+        if not owner or not owner.github_token:
+            return
+        inst.state = "building"
+        inst.build_log = "Auto-redeploy triggered by GitHub push...\n"
+        await db.commit()
+
+    project_dir = INSTANCE_PROJECTS_DIR / instance_id
+    shutil.rmtree(project_dir, ignore_errors=True)
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        zip_bytes = await _download_github_zip(owner.github_token, inst.github_repo, inst.github_branch or "main")
+    except Exception as e:
+        async with async_session() as db:
+            result = await db.execute(select(Instance).where(Instance.id == instance_id))
+            inst2 = result.scalar_one_or_none()
+            if inst2:
+                inst2.state = "failed"
+                inst2.build_log = f"Failed to download for redeploy: {e}"
+                await db.commit()
+        return
+
+    _extract_zip(zip_bytes, project_dir)
+    info = _detect_project(project_dir)
+    await _build_and_replace(instance_id, project_dir, info)
+
+
+async def _download_github_zip(token: str, repo: str, branch: str) -> bytes:
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        resp = await client.get(
+            f"https://api.github.com/repos/{repo}/zipball/{branch}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+            timeout=120,
+        )
+        if resp.status_code == 404:
+            raise Exception(f"Repository or branch not found: {repo}@{branch}")
+        if resp.status_code != 200:
+            raise Exception(f"GitHub API error {resp.status_code}")
+        return resp.content
+
+
+async def _register_github_webhook(token: str, repo: str, secret: str) -> int | None:
+    from config import PUBLIC_BASE_URL
+    webhook_url = f"{PUBLIC_BASE_URL}/api/v1/github/webhook"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://api.github.com/repos/{repo}/hooks",
+                json={
+                    "name": "web", "active": True, "events": ["push"],
+                    "config": {"url": webhook_url, "content_type": "json", "secret": secret, "insecure_ssl": "0"},
+                },
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+                timeout=15,
+            )
+            if resp.status_code == 201:
+                return resp.json().get("id")
+    except Exception:
+        pass
+    return None
+
+
+async def _add_caddy_route_ec2(instance_id: str, container_name: str, container_port: int):
+    route_config = {
+        "@id": f"instance-{instance_id}",
+        "match": [{"path": [f"/instance/{instance_id}/*"]}],
+        "handle": [
+            {"handler": "rewrite", "strip_path_prefix": f"/instance/{instance_id}"},
+            {"handler": "reverse_proxy", "upstreams": [{"dial": f"{container_name}:{container_port}"}]},
+        ],
+    }
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            f"{CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes",
+            json=route_config, timeout=10,
+        )
+
+
+async def _remove_caddy_route_ec2(instance_id: str):
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.delete(f"{CADDY_ADMIN_URL}/id/instance-{instance_id}", timeout=10)
+        except Exception:
+            pass
 
 
 # ── Tunnel ───────────────────────────────────────────────────────────────
@@ -529,6 +882,10 @@ def _instance_to_dict(instance: Instance) -> dict:
         for container_port, host_port in port_mappings.items():
             public_urls[container_port] = f"http://{SERVER_PUBLIC_IP}:{host_port}"
 
+    instance_url = None
+    if instance.project_type and SERVER_PUBLIC_IP:
+        instance_url = f"http://{SERVER_PUBLIC_IP}/instance/{instance.id}/"
+
     tunnel = _tunnels.get(instance.id)
 
     return {
@@ -543,9 +900,14 @@ def _instance_to_dict(instance: Instance) -> dict:
         "private_ip": instance.private_ip,
         "port_mappings": port_mappings,
         "public_urls": public_urls,
+        "instance_url": instance_url,
         "tunnel_url": tunnel["url"] if tunnel else None,
         "cpu_limit": instance.cpu_limit,
         "memory_limit": instance.memory_limit,
+        "github_repo": instance.github_repo,
+        "github_branch": instance.github_branch,
+        "project_label": instance.project_label,
+        "build_log": instance.build_log,
         "created_at": instance.created_at.isoformat(),
         "updated_at": instance.updated_at.isoformat(),
     }

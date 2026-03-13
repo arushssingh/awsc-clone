@@ -518,8 +518,8 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
 
             log(f"[deploy] Container started: {container.short_id}")
 
-            # Verify container is still running after startup (catches immediate crashes)
-            await asyncio.sleep(2)
+            # Verify container stays running over 5 seconds (catches crash-loops)
+            await asyncio.sleep(5)
 
             def _check_running():
                 container.reload()
@@ -529,8 +529,12 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
                 container_status, startup_logs = await asyncio.to_thread(_check_running)
                 if startup_logs.strip():
                     log(f"[deploy] Container startup logs:\n{startup_logs.rstrip()}")
+                if container_status == "restarting":
+                    log(f"[deploy] Container is crash-looping (status=restarting). The app is starting then exiting. Common causes: missing database/env vars, app binds to 127.0.0.1 internally, or unhandled exception on startup.")
+                    await _save("failed")
+                    return
                 if container_status != "running":
-                    log(f"[deploy] Container exited (status={container_status}). App may be crashing or binding to wrong host/port.")
+                    log(f"[deploy] Container exited (status={container_status}). Check startup logs above for errors.")
                     await _save("failed")
                     return
                 log(f"[deploy] Container verified running (docker ps status={container_status})")

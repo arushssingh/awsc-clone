@@ -45,7 +45,10 @@ async def reconcile_instances():
                 continue
             try:
                 container = d.containers.get(inst.docker_container_id)
-                if container.status not in ("running", "restarting"):
+                # "restarting" means the app is crash-looping — treat as stopped
+                if container.status == "running":
+                    pass  # keep existing state
+                else:
                     inst.state = "stopped"
             except Exception:
                 inst.state = "stopped"

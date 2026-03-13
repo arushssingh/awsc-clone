@@ -294,8 +294,8 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
 
             log(f"[deploy] Container started: {container.short_id}")
 
-            # Verify container is still running after startup (catches immediate crashes)
-            await asyncio.sleep(2)
+            # Verify container stays running over 5 seconds (catches crash-loops)
+            await asyncio.sleep(5)
 
             def _check_running():
                 container.reload()
@@ -305,8 +305,12 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
                 container_status, startup_logs = await asyncio.to_thread(_check_running)
                 if startup_logs.strip():
                     log(f"[deploy] Container startup logs:\n{startup_logs.rstrip()}")
+                if container_status == "restarting":
+                    log(f"[deploy] Container is crash-looping (status=restarting). The app is starting then exiting. Common causes: missing database/env vars, app binds to 127.0.0.1 internally, or unhandled exception on startup.")
+                    await _save_status("failed")
+                    return
                 if container_status != "running":
-                    log(f"[deploy] Container exited (status={container_status}). App may be crashing or binding to wrong host/port.")
+                    log(f"[deploy] Container exited (status={container_status}). Check startup logs above for errors.")
                     await _save_status("failed")
                     return
                 log(f"[deploy] Container verified running (docker ps status={container_status})")
@@ -514,14 +518,20 @@ async def get_deploy_logs(
 ):
     dep = await _get_deploy(deploy_id, db)
 
-    # Also get runtime logs if container is running
+    # Get runtime logs from the container regardless of DB status
     runtime_logs = ""
-    if dep.docker_container_id and dep.status == "running":
+    if dep.docker_container_id:
         try:
             def _get_logs():
                 c = _get_docker().containers.get(dep.docker_container_id)
-                return c.logs(stdout=True, stderr=True, tail=100).decode("utf-8", errors="replace")
-            runtime_logs = await asyncio.to_thread(_get_logs)
+                logs = c.logs(stdout=True, stderr=True, tail=100).decode("utf-8", errors="replace")
+                # Also report actual container status for debugging
+                c.reload()
+                return logs, c.status
+            logs_text, actual_status = await asyncio.to_thread(_get_logs)
+            runtime_logs = logs_text
+            if actual_status != dep.status and actual_status in ("restarting", "exited", "dead"):
+                runtime_logs = f"[warning] Container actual status is '{actual_status}' (app may be crash-looping)\n\n" + runtime_logs
         except Exception:
             pass
 

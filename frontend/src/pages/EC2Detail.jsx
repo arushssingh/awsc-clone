@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import api from '../api';
 import { useToast } from '../components/Toast';
@@ -25,9 +25,9 @@ export default function EC2Detail() {
   const [tab, setTab] = useState('overview');
   const [copied, setCopied] = useState(null);
 
-  // Tunnel
-  const [tunnelLoading, setTunnelLoading] = useState(false);
-  const [tunnelError, setTunnelError] = useState(null);
+  // Subdomain
+  const [subdomainInput, setSubdomainInput] = useState('');
+  const [subdomainSaving, setSubdomainSaving] = useState(false);
 
   // GitHub
   const [githubStatus, setGithubStatus] = useState({ connected: false, login: null });
@@ -42,7 +42,10 @@ export default function EC2Detail() {
 
   const fetchInstance = () =>
     api.get(`/ec2/instances/${id}`)
-      .then(res => setInstance(res.data))
+      .then(res => {
+        setInstance(res.data);
+        if (res.data.subdomain && !subdomainInput) setSubdomainInput(res.data.subdomain);
+      })
       .catch(() => navigate('/ec2'));
 
   const fetchGithubStatus = async () => {
@@ -104,6 +107,20 @@ export default function EC2Detail() {
     } finally { setDeploying(false); }
   };
 
+  const saveSubdomain = async () => {
+    if (!subdomainInput.trim()) { toast.error('Enter a subdomain name'); return; }
+    setSubdomainSaving(true);
+    const fd = new FormData();
+    fd.append('subdomain', subdomainInput.trim().toLowerCase());
+    try {
+      await api.post(`/ec2/instances/${id}/subdomain`, fd);
+      toast.success('Subdomain saved!');
+      fetchInstance();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to set subdomain');
+    } finally { setSubdomainSaving(false); }
+  };
+
   useEffect(() => {
     fetchInstance();
     fetchGithubStatus();
@@ -140,27 +157,6 @@ export default function EC2Detail() {
     navigator.clipboard.writeText(url);
     setCopied(url);
     setTimeout(() => setCopied(null), 2000);
-  };
-
-  const startTunnel = async () => {
-    setTunnelLoading(true);
-    setTunnelError(null);
-    try {
-      await api.post(`/ec2/instances/${id}/tunnel/start`);
-      await fetchInstance();
-    } catch (err) {
-      setTunnelError(err.response?.data?.detail || 'Failed to start tunnel');
-    } finally { setTunnelLoading(false); }
-  };
-
-  const stopTunnel = async () => {
-    setTunnelLoading(true);
-    try {
-      await api.delete(`/ec2/instances/${id}/tunnel/stop`);
-      await fetchInstance();
-    } catch (err) {
-      setTunnelError(err.response?.data?.detail || 'Failed to stop tunnel');
-    } finally { setTunnelLoading(false); }
   };
 
   if (!instance) return <div className="text-gray-400 p-8">Loading...</div>;
@@ -250,45 +246,50 @@ export default function EC2Detail() {
               </div>
             )}
 
-            {/* Shareable Link (Cloudflare Tunnel only) */}
+            {/* Custom URL */}
             <div>
-              <h3 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wide">Shareable Link</h3>
+              <h3 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wide">Custom URL</h3>
 
-              {instance.tunnel_url ? (
-                <div className="flex items-center gap-3 bg-gray-900 rounded-lg p-3 border border-green-700/30">
-                  <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs text-green-500 mb-0.5">Live Website</p>
-                    <a href={instance.tunnel_url} target="_blank" rel="noreferrer"
-                      className="text-green-400 hover:text-green-300 text-sm font-mono break-all">{instance.tunnel_url}</a>
-                  </div>
-                  <button onClick={() => copyLink(instance.tunnel_url)}
-                    className={`px-3 py-1.5 rounded text-xs whitespace-nowrap ${copied === instance.tunnel_url ? 'bg-green-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
-                    {copied === instance.tunnel_url ? 'Copied!' : 'Copy'}
-                  </button>
-                  <a href={instance.tunnel_url} target="_blank" rel="noreferrer"
-                    className="px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded text-xs whitespace-nowrap">Open</a>
-                </div>
-              ) : instance.state === 'running' && instance.github_repo ? (
+              {instance.website_url ? (
                 <div className="space-y-3">
-                  <p className="text-gray-400 text-sm">
-                    Your website is deployed. Start a Cloudflare Tunnel to get a shareable link.
-                  </p>
-                  <button onClick={startTunnel} disabled={tunnelLoading}
-                    className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded text-sm font-medium disabled:opacity-50">
-                    {tunnelLoading ? (
-                      <span className="flex items-center gap-2">
-                        <span className="w-3 h-3 border border-white border-t-transparent rounded-full animate-spin" />
-                        Starting (~15s)...
-                      </span>
-                    ) : 'Generate Shareable Link'}
-                  </button>
-                  {tunnelError && (
-                    <p className="text-red-400 text-sm bg-red-900/20 border border-red-700 rounded p-2">{tunnelError}</p>
-                  )}
+                  <div className="flex items-center gap-3 bg-gray-900 rounded-lg p-3 border border-green-700/30">
+                    <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs text-green-500 mb-0.5">Live Website</p>
+                      <a href={instance.website_url} target="_blank" rel="noreferrer"
+                        className="text-green-400 hover:text-green-300 text-sm font-mono break-all">{instance.website_url}</a>
+                    </div>
+                    <button onClick={() => copyLink(instance.website_url)}
+                      className={`px-3 py-1.5 rounded text-xs whitespace-nowrap ${copied === instance.website_url ? 'bg-green-600 text-white' : 'bg-gray-700 hover:bg-gray-600 text-gray-300'}`}>
+                      {copied === instance.website_url ? 'Copied!' : 'Copy'}
+                    </button>
+                    <a href={instance.website_url} target="_blank" rel="noreferrer"
+                      className="px-3 py-1.5 bg-green-600 hover:bg-green-700 text-white rounded text-xs whitespace-nowrap">Open</a>
+                  </div>
+                  {/* Change subdomain */}
+                  <div className="flex items-center gap-2">
+                    <input value={subdomainInput} onChange={e => setSubdomainInput(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                      placeholder="new-name" className="flex-1 px-3 py-1.5 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-blue-500 font-mono" />
+                    <span className="text-gray-500 text-sm">.cloudfabric.duckdns.org</span>
+                    <button onClick={saveSubdomain} disabled={subdomainSaving || subdomainInput === instance.subdomain}
+                      className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-xs disabled:opacity-50 whitespace-nowrap">
+                      {subdomainSaving ? 'Saving...' : 'Update'}
+                    </button>
+                  </div>
                 </div>
-              ) : instance.state !== 'building' && (
-                <p className="text-gray-500 text-sm">No website deployed yet. Connect GitHub below to deploy one.</p>
+              ) : (
+                <div className="space-y-3">
+                  <p className="text-gray-400 text-sm">Choose a custom URL for your website</p>
+                  <div className="flex items-center gap-2">
+                    <input value={subdomainInput} onChange={e => setSubdomainInput(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                      placeholder="my-website" className="flex-1 px-3 py-2 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-blue-500 font-mono" />
+                    <span className="text-gray-500 text-sm">.cloudfabric.duckdns.org</span>
+                    <button onClick={saveSubdomain} disabled={subdomainSaving || !subdomainInput.trim()}
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded text-sm font-medium disabled:opacity-50 whitespace-nowrap">
+                      {subdomainSaving ? 'Saving...' : 'Set URL'}
+                    </button>
+                  </div>
+                </div>
               )}
             </div>
 
@@ -389,21 +390,6 @@ export default function EC2Detail() {
                 </div>
               )}
             </div>
-
-            {/* Tunnel Controls */}
-            {instance.tunnel_url && (
-              <div>
-                <h3 className="text-sm font-semibold text-gray-300 mb-3 uppercase tracking-wide">Tunnel Controls</h3>
-                <div className="flex gap-2">
-                  <button onClick={startTunnel} disabled={tunnelLoading}
-                    className="px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white rounded text-sm disabled:opacity-50">
-                    {tunnelLoading ? 'Generating...' : 'New URL'}
-                  </button>
-                  <button onClick={stopTunnel} disabled={tunnelLoading}
-                    className="px-4 py-2 bg-red-700 hover:bg-red-600 text-white rounded text-sm disabled:opacity-50">Stop Tunnel</button>
-                </div>
-              </div>
-            )}
 
           </div>
         )}

@@ -122,6 +122,7 @@ class Instance(Base):
     project_label = Column(String, nullable=True)       # Human-readable
     build_log = Column(Text, nullable=True)
     docker_image_tag = Column(String, nullable=True)    # built image tag
+    subdomain = Column(String, nullable=True, unique=True)  # custom subdomain e.g. "mysite"
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -292,6 +293,7 @@ async def init_db():
             "ALTER TABLE instances ADD COLUMN project_label TEXT",
             "ALTER TABLE instances ADD COLUMN build_log TEXT",
             "ALTER TABLE instances ADD COLUMN docker_image_tag TEXT",
+            "ALTER TABLE instances ADD COLUMN subdomain TEXT UNIQUE",
         ]
         for sql in migrations:
             try:

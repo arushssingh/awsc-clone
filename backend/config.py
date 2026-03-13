@@ -61,6 +61,9 @@ def _detect_host_ip() -> str:
 
 SERVER_PUBLIC_IP = os.getenv("SERVER_PUBLIC_IP", "") or _detect_host_ip()
 
+# Base domain for custom subdomains (e.g. mysite.cloudfabric.duckdns.org)
+BASE_DOMAIN = os.getenv("BASE_DOMAIN", "cloudfabric.duckdns.org")
+
 # GitHub OAuth
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET", "")

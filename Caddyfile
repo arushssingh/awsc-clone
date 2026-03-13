@@ -1,17 +1,29 @@
 {
 	admin 0.0.0.0:2019
+	# Disable automatic HTTPS since we're using DuckDNS (no wildcard TLS without DNS challenge)
+	auto_https off
 }
 
+# Main dashboard on the base domain
 :80 {
-	# Deploy routes are added dynamically via Caddy admin API
+	@basedomain host cloudfabric.duckdns.org
+	handle @basedomain {
+		handle /api/* {
+			reverse_proxy backend:8000
+		}
 
-	handle /api/* {
-		reverse_proxy backend:8000
+		handle {
+			root * /srv/frontend
+			try_files {path} /index.html
+			file_server
+		}
 	}
 
+	# Subdomain routes are added dynamically via Caddy admin API
+	# They match on specific Host headers like mysite.cloudfabric.duckdns.org
+
+	# Fallback for unrecognized subdomains
 	handle {
-		root * /srv/frontend
-		try_files {path} /index.html
-		file_server
+		respond "This site hasn't been deployed yet." 404
 	}
 }

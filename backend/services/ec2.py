@@ -17,12 +17,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import require_permission, get_current_user
-from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END, SERVER_PUBLIC_IP, CADDY_ADMIN_URL
+from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END, SERVER_PUBLIC_IP, CADDY_ADMIN_URL, BASE_DOMAIN
 from database import Instance, VPC, User, get_db, generate_id, async_session
 from services.deploy import _detect_project, _generate_dockerfile, _extract_zip
-
-# In-memory tunnel state: instance_id → {container_id, url}
-_tunnels: dict[str, dict] = {}
 
 # Project source files stored here
 INSTANCE_PROJECTS_DIR = Path("/app/data/instance_projects")
@@ -309,12 +306,9 @@ async def terminate_instance(
     if project_dir.exists():
         shutil.rmtree(project_dir, ignore_errors=True)
 
-    # Remove Caddy route if one was added
-    if instance.project_type:
-        await _remove_caddy_route_ec2(instance.id)
-
-    # Stop tunnel
-    _stop_tunnel_container(instance.id)
+    # Remove Caddy subdomain route if one was set
+    if instance.subdomain:
+        await _remove_caddy_subdomain_route(instance.subdomain)
 
     instance.state = "terminated"
     instance.docker_container_id = None
@@ -527,15 +521,21 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
             except Exception as e:
                 log(f"[deploy] Warning: could not verify container status: {e}")
 
-            # Add Caddy route so app is reachable at /instance/{id}/
-            try:
-                await _add_caddy_route_ec2(instance_id, container_name, container_port)
-                log(f"[deploy] Caddy route added: /instance/{instance_id}/")
-            except Exception as e:
-                log(f"[deploy] Warning: Could not add Caddy route: {e}")
+            # Add Caddy subdomain route if subdomain is set
+            async with async_session() as db:
+                result = await db.execute(select(Instance).where(Instance.id == instance_id))
+                inst_check = result.scalar_one_or_none()
+                subdomain = inst_check.subdomain if inst_check else None
 
-            deploy_url = f"http://{SERVER_PUBLIC_IP or 'localhost'}/instance/{instance_id}/"
-            log(f"[deploy] Website URL: {deploy_url}")
+            if subdomain:
+                try:
+                    await _add_caddy_subdomain_route(subdomain, container_name, container_port)
+                    log(f"[deploy] Caddy route added: {subdomain}.{BASE_DOMAIN}")
+                except Exception as e:
+                    log(f"[deploy] Warning: Could not add Caddy route: {e}")
+                log(f"[deploy] Website URL: http://{subdomain}.{BASE_DOMAIN}")
+            else:
+                log("[deploy] No subdomain set — set one in the Website tab to get a URL")
             log("[deploy] Deployment successful!")
 
             private_ip = None
@@ -684,141 +684,87 @@ async def _register_github_webhook(token: str, repo: str, secret: str) -> int | 
     return None
 
 
-async def _add_caddy_route_ec2(instance_id: str, container_name: str, container_port: int):
+
+
+# ── Custom subdomain ─────────────────────────────────────────────────────
+
+@router.post("/instances/{instance_id}/subdomain")
+async def set_subdomain(
+    instance_id: str,
+    subdomain: str = Form(...),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set a custom subdomain for this instance's website."""
+    instance = await _get_instance(instance_id, db)
+
+    # Validate subdomain
+    subdomain = subdomain.strip().lower()
+    if not re.match(r'^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?$', subdomain):
+        raise HTTPException(
+            status_code=400,
+            detail="Subdomain must be lowercase letters, numbers, and hyphens (2-63 chars, can't start/end with hyphen)",
+        )
+
+    # Check uniqueness
+    existing = await db.execute(
+        select(Instance).where(Instance.subdomain == subdomain, Instance.id != instance_id)
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail=f"Subdomain '{subdomain}' is already taken")
+
+    old_subdomain = instance.subdomain
+    instance.subdomain = subdomain
+    await db.flush()
+
+    # Update Caddy route if the instance has a running website
+    if instance.state == "running" and instance.port_mappings:
+        try:
+            port_mappings = json.loads(instance.port_mappings)
+        except json.JSONDecodeError:
+            port_mappings = {}
+        container_name = f"awsclone-{instance_id}"
+        # Determine container port
+        is_static = instance.project_type in ("static", "vite", "cra", "vue", "angular", "svelte", "node-static")
+        container_port = 80 if is_static else 3000
+        if old_subdomain:
+            await _remove_caddy_subdomain_route(old_subdomain)
+        await _add_caddy_subdomain_route(subdomain, container_name, container_port)
+
+    return _instance_to_dict(instance)
+
+
+async def _add_caddy_subdomain_route(subdomain: str, container_name: str, container_port: int):
+    """Add a Caddy route that matches subdomain.BASE_DOMAIN and proxies to the container."""
+    route_id = f"subdomain-{subdomain}"
+    host = f"{subdomain}.{BASE_DOMAIN}"
     route_config = {
-        "@id": f"instance-{instance_id}",
-        "match": [{"path": [f"/instance/{instance_id}/*"]}],
+        "@id": route_id,
+        "match": [{"host": [host]}],
         "handle": [
-            {"handler": "rewrite", "strip_path_prefix": f"/instance/{instance_id}"},
-            {"handler": "reverse_proxy", "upstreams": [{"dial": f"{container_name}:{container_port}"}]},
+            {
+                "handler": "reverse_proxy",
+                "upstreams": [{"dial": f"{container_name}:{container_port}"}],
+            },
         ],
+        "terminal": True,
     }
     async with httpx.AsyncClient() as client:
         await client.post(
             f"{CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes",
-            json=route_config, timeout=10,
+            json=route_config,
+            timeout=10,
         )
 
 
-async def _remove_caddy_route_ec2(instance_id: str):
+async def _remove_caddy_subdomain_route(subdomain: str):
+    """Remove a Caddy subdomain route."""
+    route_id = f"subdomain-{subdomain}"
     async with httpx.AsyncClient() as client:
         try:
-            await client.delete(f"{CADDY_ADMIN_URL}/id/instance-{instance_id}", timeout=10)
+            await client.delete(f"{CADDY_ADMIN_URL}/id/{route_id}", timeout=10)
         except Exception:
             pass
-
-
-# ── Tunnel ───────────────────────────────────────────────────────────────
-
-@router.post("/instances/{instance_id}/tunnel/start")
-async def start_tunnel(
-    instance_id: str,
-    user: User = Depends(require_permission("ec2:DescribeInstances")),
-    db: AsyncSession = Depends(get_db),
-):
-    instance = await _get_instance(instance_id, db)
-    if instance.state != "running":
-        raise HTTPException(status_code=400, detail="Instance must be running")
-
-    # Verify the instance container is actually running before starting tunnel
-    if instance.docker_container_id:
-        def _verify_container():
-            try:
-                c = get_docker().containers.get(instance.docker_container_id)
-                c.reload()
-                return c.status
-            except docker.errors.NotFound:
-                return "not_found"
-        container_status = await asyncio.to_thread(_verify_container)
-        if container_status != "running":
-            raise HTTPException(
-                status_code=400,
-                detail=f"Instance container is not running (status={container_status}). Check logs for errors."
-            )
-
-    _stop_tunnel_container(instance_id)
-
-    port_mappings = {}
-    if instance.port_mappings:
-        try:
-            port_mappings = json.loads(instance.port_mappings)
-        except json.JSONDecodeError:
-            pass
-
-    host_port = port_mappings.get("80") or port_mappings.get(80)
-    if not host_port:
-        # Try first available port
-        if port_mappings:
-            host_port = list(port_mappings.values())[0]
-        else:
-            raise HTTPException(status_code=400, detail="Instance has no port mappings.")
-
-    def _start_and_wait():
-        import time
-        container_name = f"awsclone-tunnel-{instance_id}"
-        container = get_docker().containers.run(
-            "cloudflare/cloudflared:latest",
-            command=["tunnel", "--no-autoupdate", "--url", f"http://127.0.0.1:{host_port}"],
-            network_mode="host",
-            detach=True,
-            name=container_name,
-            labels={"awsclone": "true", "tunnel_for": instance_id},
-            remove=False,
-        )
-        url = None
-        for _ in range(30):
-            time.sleep(1)
-            logs = container.logs().decode("utf-8", errors="replace")
-            m = re.search(r"https://[a-z0-9\-]+\.trycloudflare\.com", logs)
-            if m:
-                url = m.group(0)
-                break
-        return container, url
-
-    try:
-        container, url = await asyncio.to_thread(_start_and_wait)
-    except docker.errors.ImageNotFound:
-        raise HTTPException(status_code=500, detail="Pulling cloudflared image... Try again in 30 seconds.")
-    except docker.errors.APIError as e:
-        raise HTTPException(status_code=500, detail=f"Docker error: {e.explanation}")
-
-    if not url:
-        try:
-            container.remove(force=True)
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail="Tunnel started but could not get URL.")
-
-    _tunnels[instance_id] = {"container_id": container.id, "url": url}
-    return {"tunnel_url": url}
-
-
-@router.delete("/instances/{instance_id}/tunnel/stop")
-async def stop_tunnel(
-    instance_id: str,
-    user: User = Depends(require_permission("ec2:DescribeInstances")),
-    db: AsyncSession = Depends(get_db),
-):
-    await _get_instance(instance_id, db)
-    if instance_id not in _tunnels:
-        raise HTTPException(status_code=404, detail="No active tunnel for this instance")
-    _stop_tunnel_container(instance_id)
-    return {"detail": "Tunnel stopped"}
-
-
-def _stop_tunnel_container(instance_id: str):
-    if instance_id in _tunnels:
-        try:
-            c = get_docker().containers.get(_tunnels[instance_id]["container_id"])
-            c.remove(force=True)
-        except Exception:
-            pass
-        del _tunnels[instance_id]
-    try:
-        c = get_docker().containers.get(f"awsclone-tunnel-{instance_id}")
-        c.remove(force=True)
-    except Exception:
-        pass
 
 
 @router.post("/instances/{instance_id}/upload")
@@ -877,8 +823,10 @@ def _instance_to_dict(instance: Instance) -> dict:
         except json.JSONDecodeError:
             port_mappings = {}
 
-    # No direct IP:port links — deployed websites are only accessible via Cloudflare tunnel
-    tunnel = _tunnels.get(instance.id)
+    # Website URL via custom subdomain
+    website_url = None
+    if instance.subdomain and BASE_DOMAIN:
+        website_url = f"http://{instance.subdomain}.{BASE_DOMAIN}"
 
     return {
         "id": instance.id,
@@ -891,9 +839,8 @@ def _instance_to_dict(instance: Instance) -> dict:
         "vpc_id": instance.vpc_id,
         "private_ip": instance.private_ip,
         "port_mappings": port_mappings,
-        "public_urls": {},
-        "instance_url": None,
-        "tunnel_url": tunnel["url"] if tunnel else None,
+        "subdomain": instance.subdomain,
+        "website_url": website_url,
         "cpu_limit": instance.cpu_limit,
         "memory_limit": instance.memory_limit,
         "github_repo": instance.github_repo,

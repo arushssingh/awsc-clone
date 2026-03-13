@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import require_permission, get_current_user
-from config import SERVER_PUBLIC_IP, CADDY_ADMIN_URL
+from config import SERVER_PUBLIC_IP, CADDY_ADMIN_URL, PUBLIC_BASE_URL
 from database import Deployment, User, get_db, generate_id, async_session
 
 router = APIRouter(prefix="/api/v1/deploy", tags=["deploy"])
@@ -330,7 +330,7 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
             except Exception as e:
                 log(f"[deploy] Warning: Could not add Caddy route: {e}")
 
-            deploy_url = f"http://{SERVER_PUBLIC_IP or 'localhost'}/deploy/{deploy_id}/"
+            deploy_url = f"{PUBLIC_BASE_URL}/deploy/{deploy_id}/"
             log(f"[deploy] URL: {deploy_url}")
             log("[deploy] Deployment successful!")
 
@@ -379,12 +379,7 @@ async def _add_caddy_route(deploy_id: str, container_name: str, container_port: 
             json=route_config,
             timeout=10,
         )
-        # If srv0 doesn't exist, try without server name (Caddyfile auto-names it)
-        if resp.status_code >= 400:
-            resp = await client.post(
-                f"{CADDY_ADMIN_URL}/config/apps/http/servers",
-                timeout=10,
-            )
+        resp.raise_for_status()
 
 
 async def _remove_caddy_route(deploy_id: str):
@@ -932,8 +927,8 @@ async def _get_deploy(deploy_id: str, db: AsyncSession) -> Deployment:
 
 def _deploy_to_dict(dep: Deployment) -> dict:
     url = None
-    if dep.port and SERVER_PUBLIC_IP:
-        url = f"http://{SERVER_PUBLIC_IP}/deploy/{dep.id}/"
+    if dep.port:
+        url = f"{PUBLIC_BASE_URL}/deploy/{dep.id}/"
 
     tunnel = _deploy_tunnels.get(dep.id)
 

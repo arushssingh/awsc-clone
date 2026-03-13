@@ -1,18 +1,16 @@
 {
 	admin 0.0.0.0:2019
-	# Disable auto-HTTPS — we handle SSL termination at the edge (Cloudflare or manually)
 	auto_https off
 }
 
-# Handle ALL incoming requests on port 80
-# Caddy matches routes in order — subdomain routes are prepended dynamically via admin API
-# The base domain and unmatched subdomains fall through to the handlers below
+# Caddy listens on port 80.
+# Cloudflare Tunnel sends all traffic here.
+# Subdomain routes are prepended dynamically by the backend via Caddy admin API.
+# Each route matches a specific Host header like: myapp.yourdomain.com
 :80 {
-	# ── Dynamic subdomain routes are inserted HERE via admin API ──
-	# Example injected route (added by backend when user sets subdomain):
-	# { "match": [{"host": ["myapp.1.2.3.4.sslip.io"]}], "handle": [...reverse_proxy...] }
+	# ── Dynamic subdomain routes are inserted above these handlers ──
+	# They have "terminal": true so they short-circuit before reaching /api/* or file_server
 
-	# ── Dashboard: serve frontend on base domain or direct IP ──
 	handle /api/* {
 		reverse_proxy backend:8000
 	}

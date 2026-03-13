@@ -533,7 +533,7 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
                     log(f"[deploy] Caddy route added: {subdomain}.{BASE_DOMAIN}")
                 except Exception as e:
                     log(f"[deploy] Warning: Could not add Caddy route: {e}")
-                log(f"[deploy] Website URL: http://{subdomain}.{BASE_DOMAIN}")
+                log(f"[deploy] Website URL: https://{subdomain}.{BASE_DOMAIN}")
             else:
                 log("[deploy] No subdomain set — set one in the Website tab to get a URL")
             log("[deploy] Deployment successful!")
@@ -845,7 +845,7 @@ def _instance_to_dict(instance: Instance) -> dict:
     # Website URL via custom subdomain
     website_url = None
     if instance.subdomain and BASE_DOMAIN:
-        website_url = f"http://{instance.subdomain}.{BASE_DOMAIN}"
+        website_url = f"https://{instance.subdomain}.{BASE_DOMAIN}"
 
     return {
         "id": instance.id,

@@ -2,9 +2,9 @@ services:
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
+    # Ports only needed for local access — Cloudflare Tunnel connects internally
     ports:
       - "80:80"
-      - "443:443"
       - "2019:2019"
     volumes:
       - ./data/caddy/data:/data
@@ -44,6 +44,15 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - caddy
+    networks:
+      - awsclone-internal
 
   minio:
     image: minio/minio:latest

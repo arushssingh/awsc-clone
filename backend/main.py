@@ -55,6 +55,18 @@ async def reconcile_instances():
                 inst.state = "stopped"
         await db.commit()
 
+    # Clean up stale Traefik subdomain routes
+    async with async_session() as db:
+        from services.traefik import remove_subdomain_route
+        result = await db.execute(
+            select(Instance).where(
+                Instance.subdomain.isnot(None),
+                Instance.state.in_(["terminated", "stopped"]),
+            )
+        )
+        for inst in result.scalars().all():
+            remove_subdomain_route(inst.subdomain)
+
 
 # ── Rate limiting (fixed-window, auto-cleanup) ───────────────────────────
 
@@ -109,7 +121,7 @@ async def lifespan(app: FastAPI):
 # ── Application ───────────────────────────────────────────────────────────
 
 app = FastAPI(
-    title="AWS Clone",
+    title="folateCloud",
     description="Self-hosted lightweight cloud platform",
     version="0.1.0",
     lifespan=lifespan,

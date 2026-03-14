@@ -54,9 +54,12 @@ const navGroups = [
 export default function Sidebar() {
   return (
     <aside className="w-60 bg-gray-900 border-r border-gray-700 h-screen overflow-y-auto flex-shrink-0">
-      <div className="px-4 py-4 border-b border-gray-700">
-        <h1 className="text-lg font-bold text-white">AWS Clone</h1>
-        <p className="text-xs text-gray-500">Console</p>
+      <div className="px-4 py-4 border-b border-gray-700 flex items-center gap-3">
+        <img src="/logo.png" alt="folateCloud" className="w-8 h-8 rounded" />
+        <div>
+          <h1 className="text-lg font-bold text-white">folateCloud</h1>
+          <p className="text-xs text-gray-500">Console</p>
+        </div>
       </div>
 
       <nav className="py-2">

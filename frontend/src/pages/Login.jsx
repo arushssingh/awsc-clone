@@ -34,7 +34,8 @@ export default function Login() {
     <div className="min-h-screen bg-gray-900 flex items-center justify-center px-4">
       <div className="max-w-md w-full">
         <div className="text-center mb-8">
-          <h1 className="text-3xl font-bold text-white">AWS Clone</h1>
+          <img src="/logo.png" alt="folateCloud" className="w-16 h-16 rounded mx-auto mb-4" />
+          <h1 className="text-3xl font-bold text-white">folateCloud</h1>
           <p className="text-gray-400 mt-2">Self-hosted cloud platform</p>
         </div>
 

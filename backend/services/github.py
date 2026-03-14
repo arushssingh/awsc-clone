@@ -208,12 +208,13 @@ async def github_webhook(request: Request):
             )
         )
         for dep in result.scalars().all():
-            if dep.webhook_secret and sig_header:
-                expected = "sha256=" + hmac.new(
-                    dep.webhook_secret.encode(), body, hashlib.sha256
-                ).hexdigest()
-                if not hmac.compare_digest(sig_header, expected):
-                    continue
+            if not dep.webhook_secret or not sig_header:
+                continue
+            expected = "sha256=" + hmac.new(
+                dep.webhook_secret.encode(), body, hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(sig_header, expected):
+                continue
             asyncio.create_task(_trigger_deploy_redeploy(dep.id))
             redeployed.append(f"deploy:{dep.id}")
 
@@ -225,12 +226,13 @@ async def github_webhook(request: Request):
             )
         )
         for inst in result2.scalars().all():
-            if inst.webhook_secret and sig_header:
-                expected = "sha256=" + hmac.new(
-                    inst.webhook_secret.encode(), body, hashlib.sha256
-                ).hexdigest()
-                if not hmac.compare_digest(sig_header, expected):
-                    continue
+            if not inst.webhook_secret or not sig_header:
+                continue
+            expected = "sha256=" + hmac.new(
+                inst.webhook_secret.encode(), body, hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(sig_header, expected):
+                continue
             asyncio.create_task(_trigger_instance_redeploy(inst.id))
             redeployed.append(f"instance:{inst.id}")
 

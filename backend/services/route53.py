@@ -1,4 +1,5 @@
 import json
+import re
 import socket
 from datetime import datetime
 from typing import Optional
@@ -110,6 +111,10 @@ async def create_domain(
     user: User = Depends(require_permission("route53:CreateDomain")),
     db: AsyncSession = Depends(get_db),
 ):
+    # Validate domain format
+    if not re.match(r'^[a-z0-9]([a-z0-9\-\.]{0,253}[a-z0-9])?$', body.domain.lower()):
+        raise HTTPException(status_code=400, detail="Invalid domain name")
+
     # Check domain uniqueness
     result = await db.execute(select(Domain).where(Domain.domain == body.domain))
     if result.scalar_one_or_none():

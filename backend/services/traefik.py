@@ -1,22 +1,37 @@
 """Traefik file provider helper — writes dynamic YAML config files that Traefik watches."""
 
+import re
+
 import yaml
 from pathlib import Path
 
 from config import TRAEFIK_DYNAMIC_DIR
 
 
+def _safe_filename(name: str) -> str:
+    """Sanitize a filename to prevent path traversal."""
+    return re.sub(r'[^a-zA-Z0-9._-]', '_', name)
+
+
+def _resolve_safe(filename: str) -> Path:
+    """Resolve filepath and verify it stays within TRAEFIK_DYNAMIC_DIR."""
+    filepath = (TRAEFIK_DYNAMIC_DIR / _safe_filename(filename)).resolve()
+    if not str(filepath).startswith(str(TRAEFIK_DYNAMIC_DIR.resolve())):
+        raise ValueError(f"Path traversal attempt: {filename}")
+    return filepath
+
+
 def write_route(filename: str, routers: dict, services: dict):
     """Write a Traefik dynamic config YAML file."""
     config = {"http": {"routers": routers, "services": services}}
-    filepath = TRAEFIK_DYNAMIC_DIR / filename
+    filepath = _resolve_safe(filename)
     filepath.write_text(yaml.dump(config, default_flow_style=False))
 
 
 def remove_route(filename: str):
     """Remove a Traefik dynamic config file."""
-    filepath = TRAEFIK_DYNAMIC_DIR / filename
     try:
+        filepath = _resolve_safe(filename)
         filepath.unlink(missing_ok=True)
     except Exception:
         pass
@@ -76,7 +91,7 @@ def write_deploy_route(deploy_id: str, container_name: str, container_port: int)
         }
     }
     config = {"http": {"routers": routers, "services": services, "middlewares": middlewares}}
-    filepath = TRAEFIK_DYNAMIC_DIR / filename
+    filepath = _resolve_safe(filename)
     filepath.write_text(yaml.dump(config, default_flow_style=False))
 
 

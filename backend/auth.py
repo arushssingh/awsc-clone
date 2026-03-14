@@ -211,6 +211,9 @@ class UserResponse(BaseModel):
 
 @router.post("/register", response_model=TokenResponse)
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
     # Check if username already exists
     result = await db.execute(select(User).where(User.username == body.username))
     if result.scalar_one_or_none():

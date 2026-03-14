@@ -386,7 +386,9 @@ def _extract_zip(zip_bytes: bytes, dest: Path):
             if not target:
                 continue
 
-            target_path = dest / target
+            target_path = (dest / target).resolve()
+            if not str(target_path).startswith(str(dest.resolve())):
+                continue  # skip entries that attempt path traversal
             target_path.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(member) as src, open(target_path, "wb") as dst:
                 dst.write(src.read())

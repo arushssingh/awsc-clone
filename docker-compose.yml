@@ -1,16 +1,32 @@
 services:
-  caddy:
-    image: caddy:2-alpine
+  traefik:
+    image: traefik:v3.0
     restart: unless-stopped
-    # Ports only needed for local access — Cloudflare Tunnel connects internally
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.network=awsclone-internal"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--entrypoints.web.address=:80"
     ports:
       - "80:80"
-      - "2019:2019"
     volumes:
-      - ./data/caddy/data:/data
-      - ./data/caddy/config:/config
-      - ./frontend/dist:/srv/frontend:ro
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic
+    networks:
+      - awsclone-internal
+
+  frontend:
+    image: nginx:alpine
+    restart: unless-stopped
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.frontend.priority=1"
+      - "traefik.http.routers.frontend.entrypoints=web"
     networks:
       - awsclone-internal
 
@@ -21,14 +37,21 @@ services:
     environment:
       - DATABASE_URL=sqlite+aiosqlite:////app/data/awsclone.db
       - MINIO_ENDPOINT=minio:9000
-      - CADDY_ADMIN_URL=http://caddy:2019
+      - TRAEFIK_DYNAMIC_DIR=/etc/traefik/dynamic
     volumes:
       - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./traefik/dynamic:/etc/traefik/dynamic
     extra_hosts:
       - "host.docker.internal:host-gateway"
     expose:
       - "8000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.rule=PathPrefix(`/api/`)"
+      - "traefik.http.routers.backend.priority=100"
+      - "traefik.http.routers.backend.entrypoints=web"
+      - "traefik.http.services.backend.loadbalancer.server.port=8000"
     depends_on:
       minio:
         condition: service_healthy
@@ -50,7 +73,7 @@ services:
     restart: unless-stopped
     command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
     depends_on:
-      - caddy
+      - traefik
     networks:
       - awsclone-internal
 

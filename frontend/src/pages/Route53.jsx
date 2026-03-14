@@ -116,7 +116,7 @@ export default function Route53() {
                 </div>
               )}
               <div className="bg-gray-900 rounded p-3 text-xs text-gray-400">
-                After adding, point your domain's A record to your server's public IP. Caddy will auto-obtain an SSL certificate.
+                After adding, point your domain's A record to your server's public IP. Traefik will route traffic once DNS propagates.
               </div>
               <div className="flex gap-3 pt-2">
                 <button type="submit" className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm">Add Domain</button>

@@ -17,9 +17,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import require_permission, get_current_user
-from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END, SERVER_PUBLIC_IP, CADDY_ADMIN_URL, BASE_DOMAIN
+from config import EC2_PORT_RANGE_START, EC2_PORT_RANGE_END, SERVER_PUBLIC_IP, BASE_DOMAIN
 from database import Instance, VPC, User, get_db, generate_id, async_session
 from services.deploy import _detect_project, _generate_dockerfile, _extract_zip
+from services.traefik import write_subdomain_route, remove_subdomain_route
 
 # Project source files stored here
 INSTANCE_PROJECTS_DIR = Path("/app/data/instance_projects")
@@ -306,9 +307,9 @@ async def terminate_instance(
     if project_dir.exists():
         shutil.rmtree(project_dir, ignore_errors=True)
 
-    # Remove Caddy subdomain route if one was set
+    # Remove Traefik subdomain route if one was set
     if instance.subdomain:
-        await _remove_caddy_subdomain_route(instance.subdomain)
+        remove_subdomain_route(instance.subdomain)
 
     instance.state = "terminated"
     instance.docker_container_id = None
@@ -521,7 +522,7 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
             except Exception as e:
                 log(f"[deploy] Warning: could not verify container status: {e}")
 
-            # Add Caddy subdomain route if subdomain is set
+            # Add Traefik subdomain route if subdomain is set
             async with async_session() as db:
                 result = await db.execute(select(Instance).where(Instance.id == instance_id))
                 inst_check = result.scalar_one_or_none()
@@ -529,10 +530,10 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
 
             if subdomain:
                 try:
-                    await _add_caddy_subdomain_route(subdomain, container_name, container_port)
-                    log(f"[deploy] Caddy route added: {subdomain}.{BASE_DOMAIN}")
+                    write_subdomain_route(subdomain, BASE_DOMAIN, container_name, container_port)
+                    log(f"[deploy] Traefik route added: {subdomain}.{BASE_DOMAIN}")
                 except Exception as e:
-                    log(f"[deploy] Warning: Could not add Caddy route: {e}")
+                    log(f"[deploy] Warning: Could not add Traefik route: {e}")
                 log(f"[deploy] Website URL: https://{subdomain}.{BASE_DOMAIN}")
             else:
                 log("[deploy] No subdomain set — set one in the Website tab to get a URL")
@@ -717,7 +718,7 @@ async def set_subdomain(
     instance.subdomain = subdomain
     await db.flush()
 
-    # Update Caddy route if the instance has a running website
+    # Update Traefik route if the instance has a running website
     if instance.state == "running" and instance.port_mappings:
         try:
             port_mappings = json.loads(instance.port_mappings)
@@ -728,62 +729,10 @@ async def set_subdomain(
         is_static = instance.project_type in ("static", "vite", "cra", "vue", "angular", "svelte", "node-static")
         container_port = 80 if is_static else 3000
         if old_subdomain:
-            await _remove_caddy_subdomain_route(old_subdomain)
-        await _add_caddy_subdomain_route(subdomain, container_name, container_port)
+            remove_subdomain_route(old_subdomain)
+        write_subdomain_route(subdomain, BASE_DOMAIN, container_name, container_port)
 
     return _instance_to_dict(instance)
-
-
-async def restore_subdomain_routes():
-    """Called on startup — re-registers all active subdomain Caddy routes from the DB."""
-    async with async_session() as db:
-        result = await db.execute(
-            select(Instance).where(
-                Instance.subdomain.isnot(None),
-                Instance.state == "running",
-            )
-        )
-        for inst in result.scalars().all():
-            container_name = f"awsclone-{inst.id}"
-            is_static = inst.project_type in ("static", "vite", "cra", "vue", "angular", "svelte", "node-static")
-            container_port = 80 if is_static else 3000
-            try:
-                await _add_caddy_subdomain_route(inst.subdomain, container_name, container_port)
-            except Exception:
-                pass
-
-
-async def _add_caddy_subdomain_route(subdomain: str, container_name: str, container_port: int):
-    """Add a Caddy route that matches subdomain.BASE_DOMAIN and proxies to the container."""
-    route_id = f"subdomain-{subdomain}"
-    host = f"{subdomain}.{BASE_DOMAIN}"
-    route_config = {
-        "@id": route_id,
-        "match": [{"host": [host]}],
-        "handle": [
-            {
-                "handler": "reverse_proxy",
-                "upstreams": [{"dial": f"{container_name}:{container_port}"}],
-            },
-        ],
-        "terminal": True,
-    }
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            f"{CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes",
-            json=route_config,
-            timeout=10,
-        )
-
-
-async def _remove_caddy_subdomain_route(subdomain: str):
-    """Remove a Caddy subdomain route."""
-    route_id = f"subdomain-{subdomain}"
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.delete(f"{CADDY_ADMIN_URL}/id/{route_id}", timeout=10)
-        except Exception:
-            pass
 
 
 @router.post("/instances/{instance_id}/upload")

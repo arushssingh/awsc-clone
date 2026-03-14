@@ -3,15 +3,15 @@ import socket
 from datetime import datetime
 from typing import Optional
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import require_permission
-from config import CADDY_ADMIN_URL, SERVER_PUBLIC_IP
+from config import SERVER_PUBLIC_IP
 from database import Domain, Instance, User, get_db, generate_id
+from services.traefik import write_domain_route, remove_domain_route
 
 router = APIRouter(prefix="/api/v1/route53", tags=["route53"])
 
@@ -33,74 +33,6 @@ class UpdateDomainRequest(BaseModel):
     ssl_enabled: Optional[bool] = None
 
 
-# ── Caddy admin API helpers ──────────────────────────────────────────────
-
-async def _caddy_add_route(route_id: str, domain: str, upstream: str):
-    """Add a reverse proxy route to Caddy via its admin API."""
-    route = {
-        "@id": route_id,
-        "match": [{"host": [domain]}],
-        "handle": [
-            {
-                "handler": "reverse_proxy",
-                "upstreams": [{"dial": upstream}],
-            }
-        ],
-    }
-    async with httpx.AsyncClient() as client:
-        # Try to append to existing routes array
-        resp = await client.post(
-            f"{CADDY_ADMIN_URL}/config/apps/http/servers/main/routes",
-            json=route,
-            timeout=10,
-        )
-        if resp.status_code >= 400:
-            # If the server config doesn't exist yet, create the full structure
-            full_config = {
-                "apps": {
-                    "http": {
-                        "servers": {
-                            "main": {
-                                "listen": [":443", ":80"],
-                                "routes": [route],
-                            }
-                        }
-                    }
-                }
-            }
-            resp = await client.post(
-                f"{CADDY_ADMIN_URL}/load",
-                json=full_config,
-                timeout=10,
-            )
-            if resp.status_code >= 400:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Caddy config failed: {resp.text}",
-                )
-
-
-async def _caddy_remove_route(route_id: str):
-    """Remove a route from Caddy by its @id."""
-    async with httpx.AsyncClient() as client:
-        resp = await client.delete(
-            f"{CADDY_ADMIN_URL}/id/{route_id}",
-            timeout=10,
-        )
-        # 404 is fine — route may not exist
-        if resp.status_code >= 400 and resp.status_code != 404:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Caddy route removal failed: {resp.text}",
-            )
-
-
-async def _caddy_update_route(route_id: str, domain: str, upstream: str):
-    """Update a route by removing and re-adding."""
-    await _caddy_remove_route(route_id)
-    await _caddy_add_route(route_id, domain, upstream)
-
-
 # ── Resolve target to upstream address ───────────────────────────────────
 
 async def _resolve_upstream(
@@ -109,11 +41,11 @@ async def _resolve_upstream(
     target_address: Optional[str],
     db: AsyncSession,
 ) -> str:
-    """Resolve the domain target to a host:port upstream for Caddy."""
+    """Resolve the domain target to a host:port upstream."""
     if target_type == "external":
         if not target_address:
             raise HTTPException(status_code=400, detail="target_address required for external type")
-        # Strip protocol for Caddy dial format
+        # Strip protocol for upstream format
         addr = target_address
         for prefix in ("http://", "https://"):
             if addr.startswith(prefix):
@@ -189,12 +121,11 @@ async def create_domain(
     domain_id = generate_id()
     route_id = f"domain-{domain_id}"
 
-    # Push route to Caddy
+    # Write Traefik dynamic config file
     try:
-        await _caddy_add_route(route_id, body.domain, upstream)
+        write_domain_route(route_id, body.domain, upstream)
         state = "active"
-    except Exception as e:
-        # Caddy might not be reachable yet — save as pending
+    except Exception:
         state = "pending"
 
     domain = Domain(
@@ -215,7 +146,7 @@ async def create_domain(
     resp["instructions"] = (
         f"Point your domain's A record to your server's public IP"
         f"{(' (' + SERVER_PUBLIC_IP + ')') if SERVER_PUBLIC_IP else ''}. "
-        f"Caddy will automatically obtain an SSL certificate once DNS propagates."
+        f"Traefik will route traffic once DNS propagates."
     )
     return resp
 
@@ -236,9 +167,9 @@ async def update_domain(
     # Re-resolve upstream
     upstream = await _resolve_upstream(target_type, target_id, target_address, db)
 
-    # Update Caddy route
+    # Update Traefik route file
     try:
-        await _caddy_update_route(domain.caddy_route_id, domain.domain, upstream)
+        write_domain_route(domain.caddy_route_id, domain.domain, upstream)
         domain.state = "active"
     except Exception:
         domain.state = "pending"
@@ -262,12 +193,12 @@ async def delete_domain(
 ):
     domain = await _get_domain(domain_id, db)
 
-    # Remove from Caddy
+    # Remove Traefik route file
     if domain.caddy_route_id:
         try:
-            await _caddy_remove_route(domain.caddy_route_id)
+            remove_domain_route(domain.caddy_route_id)
         except Exception:
-            pass  # Best effort
+            pass
 
     await db.delete(domain)
     return {"detail": "Domain removed"}
@@ -337,27 +268,10 @@ async def get_ssl_status(
     if not domain.ssl_enabled:
         return {"ssl_enabled": False, "status": "disabled"}
 
-    # Query Caddy for certificate info
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                f"{CADDY_ADMIN_URL}/config/apps/tls/certificates",
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                return {
-                    "ssl_enabled": True,
-                    "status": "active",
-                    "message": "Caddy manages SSL certificates automatically via Let's Encrypt.",
-                    "domain": domain.domain,
-                }
-    except Exception:
-        pass
-
     return {
         "ssl_enabled": True,
         "status": "pending",
-        "message": "SSL certificate is pending. Ensure DNS is pointed to your server.",
+        "message": "SSL is handled by Cloudflare Tunnel. Ensure your tunnel is configured.",
         "domain": domain.domain,
     }
 

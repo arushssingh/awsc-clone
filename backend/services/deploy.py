@@ -18,8 +18,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import require_permission, get_current_user
-from config import SERVER_PUBLIC_IP, CADDY_ADMIN_URL, PUBLIC_BASE_URL
+from config import SERVER_PUBLIC_IP, PUBLIC_BASE_URL
 from database import Deployment, User, get_db, generate_id, async_session
+from services.traefik import write_deploy_route, remove_deploy_route
 
 router = APIRouter(prefix="/api/v1/deploy", tags=["deploy"])
 
@@ -323,12 +324,12 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
             except Exception as e:
                 log(f"[deploy] Warning: could not verify container status: {e}")
 
-            # Add Caddy reverse proxy route so the app is accessible via port 80
+            # Add Traefik route so the app is accessible via /deploy/{id}/
             try:
-                await _add_caddy_route(deploy_id, container_name, container_port)
-                log(f"[deploy] Caddy route added: /deploy/{deploy_id}/")
+                write_deploy_route(deploy_id, container_name, container_port)
+                log(f"[deploy] Traefik route added: /deploy/{deploy_id}/")
             except Exception as e:
-                log(f"[deploy] Warning: Could not add Caddy route: {e}")
+                log(f"[deploy] Warning: Could not add Traefik route: {e}")
 
             deploy_url = f"{PUBLIC_BASE_URL}/deploy/{deploy_id}/"
             log(f"[deploy] URL: {deploy_url}")
@@ -351,48 +352,6 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
         except Exception as e:
             log(f"[error] Unexpected: {e}")
             await _save_status("failed")
-
-
-# ── Caddy route management ───────────────────────────────────────────
-
-async def _add_caddy_route(deploy_id: str, container_name: str, container_port: int):
-    """Add a reverse proxy route in Caddy so the deploy is accessible via /deploy/{id}/."""
-    route_id = f"deploy-{deploy_id}"
-    route_config = {
-        "@id": route_id,
-        "match": [{"path": [f"/deploy/{deploy_id}/*"]}],
-        "handle": [
-            {
-                "handler": "rewrite",
-                "strip_path_prefix": f"/deploy/{deploy_id}",
-            },
-            {
-                "handler": "reverse_proxy",
-                "upstreams": [{"dial": f"{container_name}:{container_port}"}],
-            },
-        ],
-    }
-    async with httpx.AsyncClient() as client:
-        # Prepend route so it's matched before the catch-all file_server
-        resp = await client.post(
-            f"{CADDY_ADMIN_URL}/config/apps/http/servers/srv0/routes",
-            json=route_config,
-            timeout=10,
-        )
-        resp.raise_for_status()
-
-
-async def _remove_caddy_route(deploy_id: str):
-    """Remove a Caddy route for a deployment."""
-    route_id = f"deploy-{deploy_id}"
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.delete(
-                f"{CADDY_ADMIN_URL}/id/{route_id}",
-                timeout=10,
-            )
-        except Exception:
-            pass
 
 
 # ── Extract ZIP with folder normalization ────────────────────────────
@@ -645,8 +604,8 @@ async def delete_deployment(
 ):
     dep = await _get_deploy(deploy_id, db)
 
-    # Remove Caddy route
-    await _remove_caddy_route(deploy_id)
+    # Remove Traefik route
+    remove_deploy_route(deploy_id)
 
     # Remove container
     if dep.docker_container_id:

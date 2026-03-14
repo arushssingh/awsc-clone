@@ -49,7 +49,7 @@ ok "Node   $(node --version)"
 
 # ── 3. Create data directories ────────────────────────────────────────────────
 info "Creating data directories..."
-mkdir -p data/caddy/data data/caddy/config data/minio data/lambda_code
+mkdir -p data/minio data/lambda_code traefik/dynamic
 ok "Directories ready"
 
 # ── 4. Generate .env if missing ───────────────────────────────────────────────
@@ -86,7 +86,7 @@ ok "Frontend built → frontend/dist/"
 
 # ── 6. Pull / build Docker images ────────────────────────────────────────────
 info "Pulling base images and building backend..."
-docker compose pull --quiet caddy minio 2>/dev/null || true
+docker compose pull --quiet traefik minio 2>/dev/null || true
 docker compose build --quiet backend
 ok "Images ready"
 

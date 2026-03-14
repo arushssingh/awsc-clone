@@ -19,8 +19,8 @@ MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
 MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"
 
-# Caddy
-CADDY_ADMIN_URL = os.getenv("CADDY_ADMIN_URL", "http://localhost:2019")
+# Traefik
+TRAEFIK_DYNAMIC_DIR = Path(os.getenv("TRAEFIK_DYNAMIC_DIR", "/etc/traefik/dynamic"))
 
 # EC2 port allocation range
 EC2_PORT_RANGE_START = int(os.getenv("EC2_PORT_RANGE_START", "49152"))

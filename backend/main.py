@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from database import init_db, Instance, async_session
 from auth import router as auth_router
-from services.ec2 import router as ec2_router, restore_subdomain_routes
+from services.ec2 import router as ec2_router
 from services.vpc import router as vpc_router
 from services.s3 import router as s3_router
 from services.lambda_ import router as lambda_router
@@ -93,7 +93,6 @@ def _check_rate_limit(ip: str) -> bool:
 async def lifespan(app: FastAPI):
     await init_db()
     await reconcile_instances()
-    await restore_subdomain_routes()
 
     tasks = [
         asyncio.create_task(metrics_collector()),

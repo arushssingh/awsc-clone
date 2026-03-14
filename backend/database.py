@@ -276,7 +276,8 @@ async def init_db():
     """Create all tables if they don't exist, and migrate existing ones."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Safe migrations for existing databases
+        # Legacy manual migrations for existing databases.
+        # These are kept as a fallback; new migrations should use Alembic.
         from sqlalchemy import text
         migrations = [
             "ALTER TABLE users ADD COLUMN github_token TEXT",
@@ -293,13 +294,44 @@ async def init_db():
             "ALTER TABLE instances ADD COLUMN project_label TEXT",
             "ALTER TABLE instances ADD COLUMN build_log TEXT",
             "ALTER TABLE instances ADD COLUMN docker_image_tag TEXT",
-            "ALTER TABLE instances ADD COLUMN subdomain TEXT UNIQUE",
+            "ALTER TABLE instances ADD COLUMN subdomain TEXT",
         ]
         for sql in migrations:
             try:
                 await conn.execute(text(sql))
             except Exception:
                 pass  # Column already exists
+        # SQLite doesn't support ADD COLUMN ... UNIQUE, so create the index separately
+        try:
+            await conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_instances_subdomain ON instances(subdomain)"
+            ))
+        except Exception:
+            pass
+
+    # Run Alembic migrations and stamp current head
+    _run_alembic_migrations()
+
+
+def _run_alembic_migrations():
+    """Run Alembic migrations to bring the database to the latest schema."""
+    import os
+    from alembic.config import Config
+    from alembic import command
+
+    alembic_dir = os.path.dirname(__file__)
+    alembic_cfg = Config(os.path.join(alembic_dir, "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", os.path.join(alembic_dir, "alembic"))
+
+    try:
+        command.upgrade(alembic_cfg, "head")
+    except Exception:
+        # If upgrade fails (e.g. columns already exist from manual migration),
+        # stamp the current revision so future migrations work correctly.
+        try:
+            command.stamp(alembic_cfg, "head")
+        except Exception:
+            pass
 
 
 async def get_db() -> AsyncSession:

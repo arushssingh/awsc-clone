@@ -1,0 +1,12 @@
+http:
+  routers:
+    subdomain-list:
+      entryPoints:
+      - web
+      rule: Host(`list.folatecloud.online`)
+      service: subdomain-list
+  services:
+    subdomain-list:
+      loadBalancer:
+        servers:
+        - url: http://awsclone-b55f792c87464d7b:80

@@ -155,6 +155,7 @@ async def launch_instance(
             "environment": body.environment or {},
             "labels": {"awsclone": "true", "instance_id": instance_id, "owner": user.id},
             "cap_drop": ["ALL"],
+            "cap_add": ["CHOWN", "SETGID", "SETUID", "NET_BIND_SERVICE"],
             "security_opt": ["no-new-privileges:true"],
         }
         if port_bindings:
@@ -493,6 +494,7 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
                     restart_policy={"Name": "unless-stopped"},
                     network="awsclone-internal",
                     cap_drop=["ALL"],
+                    cap_add=["CHOWN", "SETGID", "SETUID", "NET_BIND_SERVICE"],
                     security_opt=["no-new-privileges:true"],
                 )
                 container.reload()

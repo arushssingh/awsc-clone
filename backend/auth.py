@@ -347,6 +347,11 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Account is disabled")
 
     role_names = [r.name for r in user.roles]
+
+    # Retroactively assign default role to existing users with no roles
+    if not user.is_root and len(role_names) == 0:
+        role_names = await _ensure_default_role(user.id, db)
+
     expires = datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
     token = create_token(user.id, user.username, role_names)
 

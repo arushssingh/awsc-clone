@@ -110,10 +110,7 @@ async def delete_bucket(
     user: User = Depends(require_permission("s3:DeleteBucket")),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(Bucket).where(Bucket.name == bucket_name))
-    bucket = result.scalar_one_or_none()
-    if not bucket:
-        raise HTTPException(status_code=404, detail="Bucket not found")
+    bucket = await _check_bucket_exists(bucket_name, db, user)
 
     # Check if empty in MinIO
     try:
@@ -139,7 +136,7 @@ async def list_objects(
     user: User = Depends(require_permission("s3:ListObjects")),
     db: AsyncSession = Depends(get_db),
 ):
-    await _check_bucket_exists(bucket_name, db)
+    await _check_bucket_exists(bucket_name, db, user)
 
     try:
         client = get_minio()
@@ -175,7 +172,7 @@ async def get_object(
     user: User = Depends(require_permission("s3:GetObject")),
     db: AsyncSession = Depends(get_db),
 ):
-    await _check_bucket_exists(bucket_name, db)
+    await _check_bucket_exists(bucket_name, db, user)
 
     try:
         client = get_minio()
@@ -195,7 +192,7 @@ async def upload_object(
     user: User = Depends(require_permission("s3:PutObject")),
     db: AsyncSession = Depends(get_db),
 ):
-    await _check_bucket_exists(bucket_name, db)
+    await _check_bucket_exists(bucket_name, db, user)
 
     try:
         client = get_minio()
@@ -219,7 +216,7 @@ async def delete_object(
     user: User = Depends(require_permission("s3:DeleteObject")),
     db: AsyncSession = Depends(get_db),
 ):
-    await _check_bucket_exists(bucket_name, db)
+    await _check_bucket_exists(bucket_name, db, user)
 
     try:
         client = get_minio()
@@ -237,7 +234,7 @@ async def presign_object(
     user: User = Depends(require_permission("s3:GetObject")),
     db: AsyncSession = Depends(get_db),
 ):
-    await _check_bucket_exists(bucket_name, db)
+    await _check_bucket_exists(bucket_name, db, user)
 
     try:
         client = get_minio()
@@ -251,10 +248,14 @@ async def presign_object(
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-async def _check_bucket_exists(bucket_name: str, db: AsyncSession):
+async def _check_bucket_exists(bucket_name: str, db: AsyncSession, user: User) -> Bucket:
     result = await db.execute(select(Bucket).where(Bucket.name == bucket_name))
-    if not result.scalar_one_or_none():
+    bucket = result.scalar_one_or_none()
+    if not bucket:
         raise HTTPException(status_code=404, detail="Bucket not found")
+    if not user.is_root and bucket.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Bucket not found")
+    return bucket
 
 
 def _format_size(size_bytes: int) -> str:

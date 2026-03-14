@@ -51,7 +51,7 @@ async def get_vpc(
     user: User = Depends(require_permission("vpc:DescribeVpcs")),
     db: AsyncSession = Depends(get_db),
 ):
-    vpc = await _get_vpc(vpc_id, db)
+    vpc = await _get_vpc(vpc_id, db, user)
     result = await db.execute(
         select(Instance).where(Instance.vpc_id == vpc_id, Instance.state != "terminated")
     )
@@ -99,7 +99,7 @@ async def delete_vpc(
     user: User = Depends(require_permission("vpc:DeleteVpc")),
     db: AsyncSession = Depends(get_db),
 ):
-    vpc = await _get_vpc(vpc_id, db)
+    vpc = await _get_vpc(vpc_id, db, user)
 
     result = await db.execute(
         select(Instance).where(Instance.vpc_id == vpc_id, Instance.state != "terminated")
@@ -128,10 +128,12 @@ async def attach_instance(
     user: User = Depends(require_permission("vpc:AttachInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    vpc = await _get_vpc(vpc_id, db)
+    vpc = await _get_vpc(vpc_id, db, user)
     result = await db.execute(select(Instance).where(Instance.id == body.instance_id))
     instance = result.scalar_one_or_none()
     if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    if not user.is_root and instance.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Instance not found")
     if instance.state != "running":
         raise HTTPException(status_code=400, detail="Instance must be running to attach")
@@ -164,10 +166,12 @@ async def detach_instance(
     user: User = Depends(require_permission("vpc:DetachInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    vpc = await _get_vpc(vpc_id, db)
+    vpc = await _get_vpc(vpc_id, db, user)
     result = await db.execute(select(Instance).where(Instance.id == body.instance_id))
     instance = result.scalar_one_or_none()
     if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    if not user.is_root and instance.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Instance not found")
 
     if vpc.docker_network_id and instance.docker_container_id:
@@ -186,10 +190,12 @@ async def detach_instance(
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-async def _get_vpc(vpc_id: str, db: AsyncSession) -> VPC:
+async def _get_vpc(vpc_id: str, db: AsyncSession, user: User) -> VPC:
     result = await db.execute(select(VPC).where(VPC.id == vpc_id))
     vpc = result.scalar_one_or_none()
     if not vpc:
+        raise HTTPException(status_code=404, detail="VPC not found")
+    if not user.is_root and vpc.owner_id != user.id:
         raise HTTPException(status_code=404, detail="VPC not found")
     return vpc
 

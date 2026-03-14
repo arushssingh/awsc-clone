@@ -101,7 +101,7 @@ async def get_domain(
     user: User = Depends(require_permission("route53:DescribeDomain")),
     db: AsyncSession = Depends(get_db),
 ):
-    domain = await _get_domain(domain_id, db)
+    domain = await _get_domain(domain_id, db, user)
     return _domain_to_dict(domain)
 
 
@@ -163,7 +163,7 @@ async def update_domain(
     user: User = Depends(require_permission("route53:UpdateDomain")),
     db: AsyncSession = Depends(get_db),
 ):
-    domain = await _get_domain(domain_id, db)
+    domain = await _get_domain(domain_id, db, user)
 
     target_type = body.target_type or domain.target_type
     target_id = body.target_id if body.target_id is not None else domain.target_id
@@ -196,7 +196,7 @@ async def delete_domain(
     user: User = Depends(require_permission("route53:DeleteDomain")),
     db: AsyncSession = Depends(get_db),
 ):
-    domain = await _get_domain(domain_id, db)
+    domain = await _get_domain(domain_id, db, user)
 
     # Remove Traefik route file
     if domain.caddy_route_id:
@@ -215,7 +215,7 @@ async def verify_domain_dns(
     user: User = Depends(require_permission("route53:DescribeDomain")),
     db: AsyncSession = Depends(get_db),
 ):
-    domain = await _get_domain(domain_id, db)
+    domain = await _get_domain(domain_id, db, user)
 
     try:
         resolved_ips = set()
@@ -268,7 +268,7 @@ async def get_ssl_status(
     user: User = Depends(require_permission("route53:DescribeDomain")),
     db: AsyncSession = Depends(get_db),
 ):
-    domain = await _get_domain(domain_id, db)
+    domain = await _get_domain(domain_id, db, user)
 
     if not domain.ssl_enabled:
         return {"ssl_enabled": False, "status": "disabled"}
@@ -283,10 +283,12 @@ async def get_ssl_status(
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-async def _get_domain(domain_id: str, db: AsyncSession) -> Domain:
+async def _get_domain(domain_id: str, db: AsyncSession, user) -> Domain:
     result = await db.execute(select(Domain).where(Domain.id == domain_id))
     domain = result.scalar_one_or_none()
     if not domain:
+        raise HTTPException(status_code=404, detail="Domain not found")
+    if not user.is_root and domain.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Domain not found")
     return domain
 

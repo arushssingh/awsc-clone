@@ -468,7 +468,7 @@ async def get_deployment(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    dep = await _get_deploy(deploy_id, db)
+    dep = await _get_deploy(deploy_id, db, user)
     return _deploy_to_dict(dep)
 
 
@@ -478,7 +478,7 @@ async def get_deploy_logs(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    dep = await _get_deploy(deploy_id, db)
+    dep = await _get_deploy(deploy_id, db, user)
 
     # Get runtime logs from the container regardless of DB status
     runtime_logs = ""
@@ -509,7 +509,7 @@ async def redeploy(
     user: User = Depends(require_permission("ec2:RunInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    dep = await _get_deploy(deploy_id, db)
+    dep = await _get_deploy(deploy_id, db, user)
     project_dir = DEPLOYS_DIR / deploy_id
 
     if not project_dir.exists():
@@ -541,7 +541,7 @@ async def stop_deployment(
     user: User = Depends(require_permission("ec2:StopInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    dep = await _get_deploy(deploy_id, db)
+    dep = await _get_deploy(deploy_id, db, user)
     if dep.docker_container_id:
         try:
             await asyncio.to_thread(
@@ -560,7 +560,7 @@ async def start_deployment(
     user: User = Depends(require_permission("ec2:StartInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    dep = await _get_deploy(deploy_id, db)
+    dep = await _get_deploy(deploy_id, db, user)
     if not dep.docker_container_id:
         raise HTTPException(status_code=400, detail="No container. Redeploy instead.")
     try:
@@ -580,7 +580,7 @@ async def list_deploy_files(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    dep = await _get_deploy(deploy_id, db)
+    dep = await _get_deploy(deploy_id, db, user)
     project_dir = DEPLOYS_DIR / dep.id
     if not project_dir.exists():
         return []
@@ -604,7 +604,7 @@ async def delete_deployment(
     user: User = Depends(require_permission("ec2:TerminateInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    dep = await _get_deploy(deploy_id, db)
+    dep = await _get_deploy(deploy_id, db, user)
 
     # Remove Traefik route
     remove_deploy_route(deploy_id)
@@ -785,7 +785,7 @@ async def start_deploy_tunnel(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    dep = await _get_deploy(deploy_id, db)
+    dep = await _get_deploy(deploy_id, db, user)
     if dep.status != "running":
         raise HTTPException(status_code=400, detail="Deployment must be running")
     if not dep.port:
@@ -854,7 +854,7 @@ async def stop_deploy_tunnel(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    await _get_deploy(deploy_id, db)
+    await _get_deploy(deploy_id, db, user)
     if deploy_id not in _deploy_tunnels:
         raise HTTPException(status_code=404, detail="No active tunnel for this deployment")
     _stop_deploy_tunnel(deploy_id)
@@ -878,10 +878,12 @@ def _stop_deploy_tunnel(deploy_id: str):
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
-async def _get_deploy(deploy_id: str, db: AsyncSession) -> Deployment:
+async def _get_deploy(deploy_id: str, db: AsyncSession, user) -> Deployment:
     result = await db.execute(select(Deployment).where(Deployment.id == deploy_id))
     dep = result.scalar_one_or_none()
     if not dep:
+        raise HTTPException(status_code=404, detail="Deployment not found")
+    if not user.is_root and dep.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Deployment not found")
     return dep
 

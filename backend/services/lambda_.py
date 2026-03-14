@@ -75,7 +75,7 @@ async def get_function(
     user: User = Depends(require_permission("lambda:GetFunction")),
     db: AsyncSession = Depends(get_db),
 ):
-    fn = await _get_function(function_id, db)
+    fn = await _get_function(function_id, db, user)
     return _fn_to_dict(fn)
 
 
@@ -148,7 +148,7 @@ async def update_function_code(
     user: User = Depends(require_permission("lambda:UpdateFunction")),
     db: AsyncSession = Depends(get_db),
 ):
-    fn = await _get_function(function_id, db)
+    fn = await _get_function(function_id, db, user)
     code_dir = Path(fn.code_path)
 
     # Clear old code (keep directory)
@@ -182,7 +182,7 @@ async def update_function_config(
     user: User = Depends(require_permission("lambda:UpdateFunction")),
     db: AsyncSession = Depends(get_db),
 ):
-    fn = await _get_function(function_id, db)
+    fn = await _get_function(function_id, db, user)
 
     if body.timeout is not None:
         fn.timeout = body.timeout
@@ -204,7 +204,7 @@ async def delete_function(
     user: User = Depends(require_permission("lambda:DeleteFunction")),
     db: AsyncSession = Depends(get_db),
 ):
-    fn = await _get_function(function_id, db)
+    fn = await _get_function(function_id, db, user)
 
     # Remove code directory
     code_dir = Path(fn.code_path)
@@ -224,7 +224,7 @@ async def invoke_function(
     user: User = Depends(require_permission("lambda:InvokeFunction")),
     db: AsyncSession = Depends(get_db),
 ):
-    fn = await _get_function(function_id, db)
+    fn = await _get_function(function_id, db, user)
     image = RUNTIME_IMAGES.get(fn.runtime)
     if not image:
         raise HTTPException(status_code=400, detail=f"No runtime image for: {fn.runtime}")
@@ -371,7 +371,7 @@ async def list_invocations(
     user: User = Depends(require_permission("lambda:GetFunction")),
     db: AsyncSession = Depends(get_db),
 ):
-    await _get_function(function_id, db)
+    await _get_function(function_id, db, user)
     result = await db.execute(
         select(FunctionInvocation)
         .where(FunctionInvocation.function_id == function_id)
@@ -389,6 +389,7 @@ async def get_invocation(
     user: User = Depends(require_permission("lambda:GetFunction")),
     db: AsyncSession = Depends(get_db),
 ):
+    await _get_function(function_id, db, user)  # verify ownership
     result = await db.execute(
         select(FunctionInvocation).where(
             FunctionInvocation.id == invocation_id,
@@ -403,10 +404,12 @@ async def get_invocation(
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-async def _get_function(function_id: str, db: AsyncSession) -> Function:
+async def _get_function(function_id: str, db: AsyncSession, user: User) -> Function:
     result = await db.execute(select(Function).where(Function.id == function_id))
     fn = result.scalar_one_or_none()
     if not fn:
+        raise HTTPException(status_code=404, detail="Function not found")
+    if not user.is_root and fn.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Function not found")
     return fn
 

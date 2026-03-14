@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import os
 import re
 import secrets as _secrets
 import shutil
@@ -114,7 +115,7 @@ async def get_instance(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    return _instance_to_dict(await _get_instance(instance_id, db))
+    return _instance_to_dict(await _get_instance(instance_id, db, user))
 
 
 @router.post("/instances")
@@ -137,7 +138,10 @@ async def launch_instance(
     network_name = None
     if body.vpc_id:
         result = await db.execute(select(VPC).where(VPC.id == body.vpc_id))
-        if not result.scalar_one_or_none():
+        vpc = result.scalar_one_or_none()
+        if not vpc:
+            raise HTTPException(status_code=404, detail="VPC not found")
+        if not user.is_root and vpc.owner_id != user.id:
             raise HTTPException(status_code=404, detail="VPC not found")
         network_name = f"awsclone-vpc-{body.vpc_id}"
 
@@ -150,6 +154,8 @@ async def launch_instance(
             "mem_limit": itype["mem_limit"],
             "environment": body.environment or {},
             "labels": {"awsclone": "true", "instance_id": instance_id, "owner": user.id},
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
         }
         if port_bindings:
             run_kwargs["ports"] = port_bindings
@@ -198,7 +204,7 @@ async def stop_instance(
     user: User = Depends(require_permission("ec2:StopInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    instance = await _get_instance(instance_id, db)
+    instance = await _get_instance(instance_id, db, user)
     if instance.state != "running":
         raise HTTPException(status_code=400, detail="Instance is not running")
 
@@ -225,7 +231,7 @@ async def start_instance(
     user: User = Depends(require_permission("ec2:StartInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    instance = await _get_instance(instance_id, db)
+    instance = await _get_instance(instance_id, db, user)
     if instance.state != "stopped":
         raise HTTPException(status_code=400, detail="Instance is not stopped")
 
@@ -261,7 +267,7 @@ async def reboot_instance(
     user: User = Depends(require_permission("ec2:RebootInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    instance = await _get_instance(instance_id, db)
+    instance = await _get_instance(instance_id, db, user)
     if instance.state != "running":
         raise HTTPException(status_code=400, detail="Instance is not running")
 
@@ -283,7 +289,7 @@ async def terminate_instance(
     user: User = Depends(require_permission("ec2:TerminateInstance")),
     db: AsyncSession = Depends(get_db),
 ):
-    instance = await _get_instance(instance_id, db)
+    instance = await _get_instance(instance_id, db, user)
 
     if instance.docker_container_id:
         try:
@@ -324,7 +330,7 @@ async def get_instance_logs(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    instance = await _get_instance(instance_id, db)
+    instance = await _get_instance(instance_id, db, user)
     if not instance.docker_container_id:
         return {"logs": ""}
 
@@ -347,7 +353,7 @@ async def get_instance_stats(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    instance = await _get_instance(instance_id, db)
+    instance = await _get_instance(instance_id, db, user)
     if not instance.docker_container_id:
         raise HTTPException(status_code=400, detail="No container associated")
 
@@ -486,6 +492,8 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
                     mem_limit="512m",
                     restart_policy={"Name": "unless-stopped"},
                     network="awsclone-internal",
+                    cap_drop=["ALL"],
+                    security_opt=["no-new-privileges:true"],
                 )
                 container.reload()
                 return container
@@ -577,7 +585,7 @@ async def deploy_github_to_instance(
     db: AsyncSession = Depends(get_db),
 ):
     """Deploy a GitHub repo as the website for this instance."""
-    instance = await _get_instance(instance_id, db)
+    instance = await _get_instance(instance_id, db, user)
     if not user.github_token:
         raise HTTPException(status_code=400, detail="GitHub not connected")
 
@@ -697,7 +705,7 @@ async def set_subdomain(
     db: AsyncSession = Depends(get_db),
 ):
     """Set a custom subdomain for this instance's website."""
-    instance = await _get_instance(instance_id, db)
+    instance = await _get_instance(instance_id, db, user)
 
     # Validate subdomain
     subdomain = subdomain.strip().lower()
@@ -742,7 +750,7 @@ async def upload_files(
     user: User = Depends(require_permission("ec2:DescribeInstances")),
     db: AsyncSession = Depends(get_db),
 ):
-    instance = await _get_instance(instance_id, db)
+    instance = await _get_instance(instance_id, db, user)
     if instance.state != "running":
         raise HTTPException(status_code=400, detail="Instance must be running to upload files")
     if not instance.docker_container_id:
@@ -751,7 +759,11 @@ async def upload_files(
     file_data = []
     for upload in files:
         content = await upload.read()
-        file_data.append((upload.filename, content))
+        safe_name = os.path.basename(upload.filename or "upload")
+        safe_name = re.sub(r'[^\w.\-]', '_', safe_name)
+        if not safe_name or safe_name.startswith('.'):
+            safe_name = "upload_" + safe_name
+        file_data.append((safe_name, content))
 
     def _copy_files():
         container = get_docker().containers.get(instance.docker_container_id)
@@ -775,10 +787,12 @@ async def upload_files(
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-async def _get_instance(instance_id: str, db: AsyncSession) -> Instance:
+async def _get_instance(instance_id: str, db: AsyncSession, user: User) -> Instance:
     result = await db.execute(select(Instance).where(Instance.id == instance_id))
     instance = result.scalar_one_or_none()
     if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+    if not user.is_root and instance.owner_id != user.id:
         raise HTTPException(status_code=404, detail="Instance not found")
     return instance
 

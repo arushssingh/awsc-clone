@@ -2,6 +2,10 @@ services:
   traefik:
     image: traefik:v3.0
     restart: unless-stopped
+
+    environment:
+      - DOCKER_API_VERSION=1.41
+
     command:
       - "--providers.docker=true"
       - "--providers.docker.network=awsclone-internal"

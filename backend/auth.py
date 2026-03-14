@@ -178,6 +178,85 @@ def _resource_matches(resource: str, patterns: list[str]) -> bool:
     return False
 
 
+# ── Default role for new users ────────────────────────────────────────────
+
+DEFAULT_POLICY_DOCUMENT = json.dumps({
+    "statements": [
+        {
+            "effect": "allow",
+            "actions": [
+                "ec2:RunInstance",
+                "ec2:DescribeInstances",
+                "ec2:StartInstance",
+                "ec2:StopInstance",
+                "ec2:TerminateInstance",
+                "s3:ListBuckets",
+                "s3:CreateBucket",
+                "s3:DeleteBucket",
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:DeleteObject",
+                "vpc:DescribeVpcs",
+                "vpc:CreateVpc",
+                "vpc:DeleteVpc",
+                "vpc:AttachInstance",
+                "vpc:DetachInstance",
+                "lambda:ListFunctions",
+                "lambda:GetFunction",
+                "lambda:CreateFunction",
+                "lambda:UpdateFunction",
+                "lambda:DeleteFunction",
+                "lambda:InvokeFunction",
+                "route53:ListDomains",
+                "route53:DescribeDomain",
+                "route53:CreateDomain",
+                "route53:DeleteDomain",
+                "cloudwatch:PutMetricAlarm",
+                "cloudwatch:GetMetricStatistics",
+            ],
+            "resources": ["*"],
+        }
+    ]
+})
+
+
+async def _ensure_default_role(user_id: str, db: AsyncSession) -> list[str]:
+    """Create (or reuse) a default role+policy and assign it to the user."""
+    default_role_name = "DefaultUserRole"
+
+    # Check if role already exists
+    result = await db.execute(select(Role).where(Role.name == default_role_name))
+    role = result.scalar_one_or_none()
+
+    if not role:
+        # Create default policy
+        policy = Policy(
+            id=generate_id(),
+            name="DefaultUserPolicy",
+            document=DEFAULT_POLICY_DOCUMENT,
+        )
+        db.add(policy)
+
+        # Create default role
+        role = Role(
+            id=generate_id(),
+            name=default_role_name,
+            description="Default role assigned to new users with basic service permissions",
+        )
+        db.add(role)
+        await db.flush()
+
+        # Attach policy to role
+        db.add(RolePolicy(role_id=role.id, policy_id=policy.id))
+        await db.flush()
+
+    # Assign role to user
+    db.add(UserRole(user_id=user_id, role_id=role.id))
+    await db.flush()
+
+    return [default_role_name]
+
+
 # ── Request/Response schemas ─────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
@@ -238,8 +317,13 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     db.add(user)
     await db.flush()
 
+    # Assign default role with basic permissions for non-root users
+    role_names = []
+    if not is_first_user:
+        role_names = await _ensure_default_role(user.id, db)
+
     expires = datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
-    token = create_token(user.id, user.username, [])
+    token = create_token(user.id, user.username, role_names)
 
     return TokenResponse(
         token=token,

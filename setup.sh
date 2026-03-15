@@ -102,6 +102,9 @@ if [[ -d backend/lambda_runtimes/node20 ]]; then
 fi
 
 # ── 8. Start services ─────────────────────────────────────────────────────────
+info "Creating shared network (if not exists)..."
+docker network create awsclone-internal 2>/dev/null || true
+
 info "Starting services..."
 docker compose up -d
 

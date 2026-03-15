@@ -113,5 +113,4 @@ services:
 
 networks:
   awsclone-internal:
-    driver: bridge
-    name: awsclone-internal
+    external: true

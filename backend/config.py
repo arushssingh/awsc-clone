@@ -18,6 +18,9 @@ MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin123")
 MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"
+# Public endpoint used in presigned URLs returned to browsers.
+# Override when MinIO runs in Docker and localhost:9000 is not browser-reachable.
+MINIO_PUBLIC_ENDPOINT = os.getenv("MINIO_PUBLIC_ENDPOINT", MINIO_ENDPOINT)
 
 # Traefik
 TRAEFIK_DYNAMIC_DIR = Path(os.getenv("TRAEFIK_DYNAMIC_DIR", "/etc/traefik/dynamic"))

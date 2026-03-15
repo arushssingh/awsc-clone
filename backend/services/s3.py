@@ -1,6 +1,7 @@
 import io
 from datetime import timedelta
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from minio import Minio
@@ -10,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import require_permission
-from config import MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE
+from config import MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_SECURE, MINIO_PUBLIC_ENDPOINT
 from database import Bucket, User, get_db, generate_id
 
 router = APIRouter(prefix="/api/v1/s3", tags=["s3"])
@@ -29,6 +30,15 @@ def get_minio() -> Minio:
             secure=MINIO_SECURE,
         )
     return _minio_client
+
+
+def _rewrite_presigned_url(url: str) -> str:
+    """Replace the internal MinIO host with the public-facing host so browsers can reach it."""
+    if MINIO_PUBLIC_ENDPOINT == MINIO_ENDPOINT:
+        return url
+    parsed = urlparse(url)
+    public = urlparse(("https://" if MINIO_SECURE else "http://") + MINIO_PUBLIC_ENDPOINT)
+    return urlunparse(parsed._replace(scheme=public.scheme, netloc=public.netloc))
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────
@@ -179,6 +189,7 @@ async def get_object(
         url = client.presigned_get_object(
             bucket_name, key, expires=timedelta(hours=1)
         )
+        url = _rewrite_presigned_url(url)
         return {"url": url, "key": key, "bucket": bucket_name}
     except S3Error as e:
         raise HTTPException(status_code=404, detail=f"Object not found: {e.message}")
@@ -241,6 +252,7 @@ async def presign_object(
         url = client.presigned_get_object(
             bucket_name, key, expires=timedelta(seconds=body.expires_in)
         )
+        url = _rewrite_presigned_url(url)
         return {"url": url, "expires_in": body.expires_in}
     except S3Error as e:
         raise HTTPException(status_code=404, detail=f"Object not found: {e.message}")

@@ -45,7 +45,7 @@ def _rewrite_presigned_url(url: str) -> str:
 
 class CreateBucketRequest(BaseModel):
     name: str
-    region: str = "us-east-1"
+    region: str = "in-west-1"
 
 
 class PresignRequest(BaseModel):

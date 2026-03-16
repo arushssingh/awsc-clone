@@ -13,6 +13,9 @@ JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-production-please")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24
 
+if JWT_SECRET == "change-me-in-production-please" and os.getenv("ENV", "dev") != "dev":
+    raise RuntimeError("JWT_SECRET must be set to a secure random value in non-dev environments")
+
 # MinIO
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")

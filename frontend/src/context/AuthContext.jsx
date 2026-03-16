@@ -3,54 +3,67 @@ import api from '../api';
 
 const AuthContext = createContext(null);
 
-export function AuthProvider({ children }) {
-  const [user, setUser] = useState(() => {
-    const saved = localStorage.getItem('user');
+const SESSION_KEY = 'user_profile';
+
+function getCachedUser() {
+  try {
+    const saved = sessionStorage.getItem(SESSION_KEY);
     return saved ? JSON.parse(saved) : null;
-  });
-  const [loading, setLoading] = useState(true);
+  } catch {
+    return null;
+  }
+}
+
+function cacheUser(userData) {
+  if (userData) {
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(userData));
+  } else {
+    sessionStorage.removeItem(SESSION_KEY);
+  }
+}
+
+export function AuthProvider({ children }) {
+  const cached = getCachedUser();
+  const [user, setUser] = useState(cached);
+  const [loading, setLoading] = useState(!cached);
 
   useEffect(() => {
-    const token = localStorage.getItem('token');
-    if (token) {
-      api.get('/auth/me')
-        .then((res) => {
-          setUser(res.data);
-          localStorage.setItem('user', JSON.stringify(res.data));
-        })
-        .catch(() => {
-          localStorage.removeItem('token');
-          localStorage.removeItem('user');
-          setUser(null);
-        })
-        .finally(() => setLoading(false));
-    } else {
-      setLoading(false);
-    }
+    api.get('/auth/me')
+      .then((res) => {
+        setUser(res.data);
+        cacheUser(res.data);
+      })
+      .catch(() => {
+        setUser(null);
+        cacheUser(null);
+      })
+      .finally(() => setLoading(false));
   }, []);
 
   const login = async (username, password) => {
-    const res = await api.post('/auth/login', { username, password });
-    localStorage.setItem('token', res.data.token);
+    await api.post('/auth/login', { username, password });
     const meRes = await api.get('/auth/me');
     setUser(meRes.data);
-    localStorage.setItem('user', JSON.stringify(meRes.data));
+    cacheUser(meRes.data);
     return meRes.data;
   };
 
   const register = async (username, email, password) => {
-    const res = await api.post('/auth/register', { username, email, password });
-    localStorage.setItem('token', res.data.token);
+    await api.post('/auth/register', { username, email, password });
     const meRes = await api.get('/auth/me');
     setUser(meRes.data);
-    localStorage.setItem('user', JSON.stringify(meRes.data));
+    cacheUser(meRes.data);
     return meRes.data;
   };
 
-  const logout = () => {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
+  const logout = async () => {
+    try {
+      await api.post('/auth/logout');
+    } catch {
+      // Clear state even if the call fails
+    }
     setUser(null);
+    cacheUser(null);
   };
 
   return (

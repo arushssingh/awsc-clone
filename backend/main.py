@@ -140,15 +140,26 @@ async def rate_limit_middleware(request: Request, call_next):
 
 
 _cors_origins = os.getenv("CORS_ORIGINS", "")
-_allowed_origins = [o.strip() for o in _cors_origins.split(",") if o.strip()] if _cors_origins else ["*"]
+_allowed_origins = [o.strip() for o in _cors_origins.split(",") if o.strip()]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins,
-    allow_credentials=bool(_cors_origins),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if _allowed_origins:
+    # Explicit origin list: enable credentials for cookie-based auth
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allowed_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # No CORS_ORIGINS set: allow all origins without credentials (dev/same-origin only)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # ── Routers ──────────────────────────────────────────────────────────────
 

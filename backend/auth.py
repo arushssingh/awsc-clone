@@ -3,7 +3,8 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import bcrypt
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
 from pydantic import BaseModel
@@ -11,11 +12,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+import os
+
 from config import JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRY_HOURS
 from database import User, Role, Policy, UserRole, RolePolicy, get_db, generate_id
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 security = HTTPBearer(auto_error=False)
+
+COOKIE_NAME = "access_token"
+COOKIE_MAX_AGE = JWT_EXPIRY_HOURS * 3600
+COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 
 
 # ── Password hashing ────────────────────────────────────────────────────
@@ -51,13 +58,21 @@ def decode_token(token: str) -> dict:
 # ── Dependencies ─────────────────────────────────────────────────────────
 
 async def get_current_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     x_api_key: Optional[str] = Header(None),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Extract and validate the current user from JWT or API key."""
+    """Extract and validate the current user from JWT (cookie or header) or API key."""
+    # Try Bearer header first, then httpOnly cookie
+    token = None
     if credentials and credentials.credentials:
-        payload = decode_token(credentials.credentials)
+        token = credentials.credentials
+    else:
+        token = request.cookies.get(COOKIE_NAME)
+
+    if token:
+        payload = decode_token(token)
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Invalid token payload")
@@ -270,8 +285,7 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class TokenResponse(BaseModel):
-    token: str
+class AuthResponse(BaseModel):
     expires_at: str
     user_id: str
     username: str
@@ -286,9 +300,35 @@ class UserResponse(BaseModel):
     created_at: str
 
 
+# ── Cookie helpers ───────────────────────────────────────────────────────
+
+def _set_auth_cookie(response: JSONResponse, token: str) -> None:
+    """Set httpOnly cookie with the JWT token."""
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=COOKIE_MAX_AGE,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_auth_cookie(response: JSONResponse) -> None:
+    """Clear the auth cookie."""
+    response.delete_cookie(
+        key=COOKIE_NAME,
+        path="/",
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="lax",
+    )
+
+
 # ── Auth endpoints ───────────────────────────────────────────────────────
 
-@router.post("/register", response_model=TokenResponse)
+@router.post("/register")
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     if len(body.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
@@ -325,15 +365,16 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
     expires = datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
     token = create_token(user.id, user.username, role_names)
 
-    return TokenResponse(
-        token=token,
-        expires_at=expires.isoformat(),
-        user_id=user.id,
-        username=user.username,
-    )
+    response = JSONResponse(content={
+        "expires_at": expires.isoformat(),
+        "user_id": user.id,
+        "username": user.username,
+    })
+    _set_auth_cookie(response, token)
+    return response
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post("/login")
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(User).options(selectinload(User.roles)).where(User.username == body.username)
@@ -355,26 +396,36 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
     expires = datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
     token = create_token(user.id, user.username, role_names)
 
-    return TokenResponse(
-        token=token,
-        expires_at=expires.isoformat(),
-        user_id=user.id,
-        username=user.username,
-    )
+    response = JSONResponse(content={
+        "expires_at": expires.isoformat(),
+        "user_id": user.id,
+        "username": user.username,
+    })
+    _set_auth_cookie(response, token)
+    return response
 
 
-@router.post("/refresh", response_model=TokenResponse)
+@router.post("/refresh")
 async def refresh(current_user: User = Depends(get_current_user)):
     role_names = [r.name for r in current_user.roles]
     expires = datetime.utcnow() + timedelta(hours=JWT_EXPIRY_HOURS)
     token = create_token(current_user.id, current_user.username, role_names)
 
-    return TokenResponse(
-        token=token,
-        expires_at=expires.isoformat(),
-        user_id=current_user.id,
-        username=current_user.username,
-    )
+    response = JSONResponse(content={
+        "expires_at": expires.isoformat(),
+        "user_id": current_user.id,
+        "username": current_user.username,
+    })
+    _set_auth_cookie(response, token)
+    return response
+
+
+@router.post("/logout")
+async def logout(current_user: User = Depends(get_current_user)):
+    """Clear the auth cookie."""
+    response = JSONResponse(content={"detail": "Logged out"})
+    _clear_auth_cookie(response)
+    return response
 
 
 @router.get("/me", response_model=UserResponse)

@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import require_permission
 from config import LAMBDA_MAX_CONCURRENT, LAMBDA_CODE_DIR
-from database import Function, FunctionInvocation, User, get_db, generate_id
+from database import Function, FunctionInvocation, User, get_db, generate_id, async_session
 
 router = APIRouter(prefix="/api/v1/lambda", tags=["lambda"])
 
@@ -240,8 +240,17 @@ async def invoke_function(
     db.add(invocation)
     await db.flush()
 
+    # Capture what we need, then release the request DB session
+    fn_code_path = fn.code_path
+    fn_handler = fn.handler
+    fn_name = fn.name
+    fn_memory_limit = fn.memory_limit
+    fn_timeout = fn.timeout
+    fn_environment = fn.environment
+    fn_id = fn.id
+
     # Write event payload to code directory
-    code_dir = Path(fn.code_path)
+    code_dir = Path(fn_code_path)
     event_file = code_dir / "_event.json"
     with open(event_file, "w") as f:
         json.dump(body.payload, f)
@@ -249,119 +258,134 @@ async def invoke_function(
     # Parse user environment
     user_env = {}
     try:
-        user_env = json.loads(fn.environment)
+        user_env = json.loads(fn_environment)
     except (json.JSONDecodeError, TypeError):
         pass
 
     # Run in ephemeral container with concurrency limit
+    # Use a separate DB session so we don't hold the request session during execution
     async with _invoke_semaphore:
-        invocation.status = "running"
-        await db.flush()
-
         start_time = time.time()
         container = None
-        try:
-            client = get_docker()
-            container = client.containers.run(
-                image=image,
-                detach=True,
-                volumes={str(code_dir): {"bind": "/var/task", "mode": "ro"}},
-                environment={
-                    **user_env,
-                    "HANDLER": fn.handler,
-                    "FUNCTION_NAME": fn.name,
-                    "MEMORY_LIMIT": str(fn.memory_limit),
-                },
-                mem_limit=f"{fn.memory_limit}m",
-                nano_cpus=500_000_000,  # 0.5 CPU for all Lambda
-                network_disabled=True,
-                name=f"awsclone-lambda-{invocation_id}",
-                labels={"awsclone": "true", "type": "lambda"},
-            )
+        inv_status = "running"
+        inv_output = None
+        inv_error = None
+        inv_duration_ms = None
+        inv_completed_at = None
 
-            # Wait for container to finish
+        try:
+            def _run_container():
+                client = get_docker()
+                return client.containers.run(
+                    image=image,
+                    detach=True,
+                    volumes={str(code_dir): {"bind": "/var/task", "mode": "ro"}},
+                    environment={
+                        **user_env,
+                        "HANDLER": fn_handler,
+                        "FUNCTION_NAME": fn_name,
+                        "MEMORY_LIMIT": str(fn_memory_limit),
+                    },
+                    mem_limit=f"{fn_memory_limit}m",
+                    nano_cpus=500_000_000,
+                    network_disabled=True,
+                    name=f"awsclone-lambda-{invocation_id}",
+                    labels={"awsclone": "true", "type": "lambda"},
+                )
+
+            container = await asyncio.to_thread(_run_container)
+
+            # Wait for container to finish (in thread to avoid blocking)
             try:
-                result = container.wait(timeout=fn.timeout)
+                result = await asyncio.to_thread(container.wait, timeout=fn_timeout)
                 exit_code = result.get("StatusCode", -1)
             except Exception:
-                # Timeout
                 try:
-                    container.kill()
+                    await asyncio.to_thread(container.kill)
                 except Exception:
                     pass
-                invocation.status = "timeout"
-                invocation.error = f"Function timed out after {fn.timeout}s"
-                invocation.duration_ms = int((time.time() - start_time) * 1000)
-                invocation.completed_at = datetime.utcnow()
-                await db.flush()
+                inv_status = "timeout"
+                inv_error = f"Function timed out after {fn_timeout}s"
+                inv_duration_ms = int((time.time() - start_time) * 1000)
+                inv_completed_at = datetime.utcnow()
 
-                # Cleanup
-                try:
-                    container.remove(force=True)
-                except Exception:
-                    pass
+                # Save results in a fresh session
+                async with async_session() as write_db:
+                    res = await write_db.execute(select(FunctionInvocation).where(FunctionInvocation.id == invocation_id))
+                    inv = res.scalar_one()
+                    inv.status = inv_status
+                    inv.error = inv_error
+                    inv.duration_ms = inv_duration_ms
+                    inv.completed_at = inv_completed_at
+                    await write_db.commit()
 
-                # Clean up event file
-                event_file.unlink(missing_ok=True)
+                return _invocation_to_dict(inv)
 
-                return _invocation_to_dict(invocation)
-
-            duration_ms = int((time.time() - start_time) * 1000)
+            inv_duration_ms = int((time.time() - start_time) * 1000)
 
             # Capture logs
-            logs = container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+            logs = await asyncio.to_thread(
+                lambda: container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace").strip()
+            )
 
             # Parse output
-            output = None
-            error = None
             try:
-                parsed = json.loads(logs.split("\n")[-1])  # Last line is the JSON output
+                parsed = json.loads(logs.split("\n")[-1])
                 if parsed.get("status") == "success":
-                    invocation.status = "success"
-                    output = json.dumps(parsed.get("output"), default=str)
+                    inv_status = "success"
+                    inv_output = json.dumps(parsed.get("output"), default=str)
                 else:
-                    invocation.status = "error"
-                    error = parsed.get("error", "Unknown error")
+                    inv_status = "error"
+                    inv_error = parsed.get("error", "Unknown error")
                     if parsed.get("trace"):
-                        error += "\n" + parsed["trace"]
+                        inv_error += "\n" + parsed["trace"]
             except (json.JSONDecodeError, IndexError):
                 if exit_code == 0:
-                    invocation.status = "success"
-                    output = logs
+                    inv_status = "success"
+                    inv_output = logs
                 else:
-                    invocation.status = "error"
-                    error = logs or f"Exit code: {exit_code}"
+                    inv_status = "error"
+                    inv_error = logs or f"Exit code: {exit_code}"
 
-            invocation.output = output
-            invocation.error = error
-            invocation.duration_ms = duration_ms
-            invocation.completed_at = datetime.utcnow()
+            inv_completed_at = datetime.utcnow()
 
         except docker.errors.ImageNotFound:
-            invocation.status = "error"
-            invocation.error = f"Runtime image not found: {image}. Run the setup script to build Lambda images."
-            invocation.duration_ms = int((time.time() - start_time) * 1000)
-            invocation.completed_at = datetime.utcnow()
+            inv_status = "error"
+            inv_error = f"Runtime image not found: {image}. Run the setup script to build Lambda images."
+            inv_duration_ms = int((time.time() - start_time) * 1000)
+            inv_completed_at = datetime.utcnow()
         except docker.errors.APIError as e:
-            invocation.status = "error"
-            invocation.error = f"Docker error: {e.explanation}"
-            invocation.duration_ms = int((time.time() - start_time) * 1000)
-            invocation.completed_at = datetime.utcnow()
+            inv_status = "error"
+            inv_error = f"Docker error: {e.explanation}"
+            inv_duration_ms = int((time.time() - start_time) * 1000)
+            inv_completed_at = datetime.utcnow()
         finally:
-            # Always clean up container
             if container:
                 try:
-                    container.remove(force=True)
+                    await asyncio.to_thread(lambda: container.remove(force=True))
                 except Exception:
                     pass
-            # Clean up event file
             event_file.unlink(missing_ok=True)
 
-    # Update function last invocation time
-    fn.last_invocation_at = datetime.utcnow()
-    await db.flush()
+    # Write final results in a fresh session (request session may be stale)
+    async with async_session() as write_db:
+        res = await write_db.execute(select(FunctionInvocation).where(FunctionInvocation.id == invocation_id))
+        inv = res.scalar_one()
+        inv.status = inv_status
+        inv.output = inv_output
+        inv.error = inv_error
+        inv.duration_ms = inv_duration_ms
+        inv.completed_at = inv_completed_at
 
-    return _invocation_to_dict(invocation)
+        # Update function last invocation time
+        fn_res = await write_db.execute(select(Function).where(Function.id == fn_id))
+        fn_obj = fn_res.scalar_one_or_none()
+        if fn_obj:
+            fn_obj.last_invocation_at = datetime.utcnow()
+
+        await write_db.commit()
+
+    return _invocation_to_dict(inv)
 
 
 @router.get("/functions/{function_id}/invocations")

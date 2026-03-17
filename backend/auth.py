@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -16,6 +17,10 @@ import os
 
 from config import JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRY_HOURS
 from database import User, Role, Policy, UserRole, RolePolicy, get_db, generate_id
+
+# ── Policy cache (TTL-based, avoids 3-table JOIN on every request) ────────
+_POLICY_CACHE_TTL = 60  # seconds
+_policy_cache: dict[str, tuple[float, list[dict]]] = {}  # user_id → (expires_at, policies)
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 security = HTTPBearer(auto_error=False)
@@ -125,7 +130,12 @@ def require_permission(action: str, resource: str = "*"):
 
 
 async def _load_user_policies(user_id: str, db: AsyncSession) -> list[dict]:
-    """Load all policy documents for a user via their roles."""
+    """Load all policy documents for a user via their roles (cached with TTL)."""
+    now = time.monotonic()
+    cached = _policy_cache.get(user_id)
+    if cached and cached[0] > now:
+        return cached[1]
+
     result = await db.execute(
         select(Policy)
         .join(RolePolicy, Policy.id == RolePolicy.policy_id)
@@ -139,6 +149,8 @@ async def _load_user_policies(user_id: str, db: AsyncSession) -> list[dict]:
             docs.append(json.loads(p.document))
         except json.JSONDecodeError:
             continue
+
+    _policy_cache[user_id] = (now + _POLICY_CACHE_TTL, docs)
     return docs
 
 

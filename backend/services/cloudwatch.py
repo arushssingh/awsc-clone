@@ -64,20 +64,46 @@ class UpdateAlarmRequest(BaseModel):
 
 # ── Background tasks ────────────────────────────────────────────────────
 
+async def _collect_container_stats(client, container_id: str) -> dict | None:
+    """Collect stats for a single container in a thread (non-blocking)."""
+    try:
+        def _get_stats():
+            container = client.containers.get(container_id)
+            return container.stats(stream=False)
+
+        stats = await asyncio.to_thread(_get_stats)
+        cpu_delta = (
+            stats["cpu_stats"]["cpu_usage"]["total_usage"]
+            - stats["precpu_stats"]["cpu_usage"]["total_usage"]
+        )
+        system_delta = (
+            stats["cpu_stats"]["system_cpu_usage"]
+            - stats["precpu_stats"]["system_cpu_usage"]
+        )
+        cpu_pct = (cpu_delta / system_delta) * 100.0 if system_delta > 0 else 0
+        mem_used = stats["memory_stats"].get("usage", 0) / (1024 * 1024)
+        return {"cpu": round(cpu_pct, 2), "mem": round(mem_used, 2)}
+    except Exception:
+        return None
+
+
 async def metrics_collector():
     """Background task: collect system + container metrics every interval."""
     while True:
         try:
-            # System metrics
-            metrics = {
-                "cpu_percent": psutil.cpu_percent(interval=1),
-                "memory_percent": psutil.virtual_memory().percent,
-                "memory_used_mb": psutil.virtual_memory().used / (1024 * 1024),
-                "disk_percent": psutil.disk_usage("/").percent,
-                "disk_used_gb": psutil.disk_usage("/").used / (1024 ** 3),
-                "network_bytes_sent": psutil.net_io_counters().bytes_sent,
-                "network_bytes_recv": psutil.net_io_counters().bytes_recv,
-            }
+            # Collect system metrics in a thread to avoid blocking on cpu_percent(interval=1)
+            def _system_metrics():
+                return {
+                    "cpu_percent": psutil.cpu_percent(interval=1),
+                    "memory_percent": psutil.virtual_memory().percent,
+                    "memory_used_mb": psutil.virtual_memory().used / (1024 * 1024),
+                    "disk_percent": psutil.disk_usage("/").percent,
+                    "disk_used_gb": psutil.disk_usage("/").used / (1024 ** 3),
+                    "network_bytes_sent": psutil.net_io_counters().bytes_sent,
+                    "network_bytes_recv": psutil.net_io_counters().bytes_recv,
+                }
+
+            metrics = await asyncio.to_thread(_system_metrics)
 
             async with async_session() as db:
                 now = datetime.utcnow()
@@ -89,11 +115,10 @@ async def metrics_collector():
                         unit=UNITS.get(name, "None"),
                     ))
 
-                # Per-container stats
+                # Per-container stats — collected in parallel threads
                 client = get_docker()
                 if client:
                     try:
-                        # Get running awsclone containers
                         result = await db.execute(
                             select(Instance).where(
                                 Instance.state == "running",
@@ -102,39 +127,30 @@ async def metrics_collector():
                         )
                         instances = result.scalars().all()
 
-                        for inst in instances:
-                            try:
-                                container = client.containers.get(inst.docker_container_id)
-                                stats = container.stats(stream=False)
+                        # Gather all container stats concurrently
+                        stats_tasks = [
+                            _collect_container_stats(client, inst.docker_container_id)
+                            for inst in instances
+                        ]
+                        stats_results = await asyncio.gather(*stats_tasks)
 
-                                cpu_delta = (
-                                    stats["cpu_stats"]["cpu_usage"]["total_usage"]
-                                    - stats["precpu_stats"]["cpu_usage"]["total_usage"]
-                                )
-                                system_delta = (
-                                    stats["cpu_stats"]["system_cpu_usage"]
-                                    - stats["precpu_stats"]["system_cpu_usage"]
-                                )
-                                cpu_pct = (cpu_delta / system_delta) * 100.0 if system_delta > 0 else 0
-
-                                mem_used = stats["memory_stats"].get("usage", 0) / (1024 * 1024)
-
-                                db.add(Metric(
-                                    timestamp=now,
-                                    metric_name="container_cpu_percent",
-                                    value=round(cpu_pct, 2),
-                                    unit="Percent",
-                                    dimensions=json.dumps({"instance_id": inst.id}),
-                                ))
-                                db.add(Metric(
-                                    timestamp=now,
-                                    metric_name="container_memory_mb",
-                                    value=round(mem_used, 2),
-                                    unit="Megabytes",
-                                    dimensions=json.dumps({"instance_id": inst.id}),
-                                ))
-                            except Exception:
-                                pass
+                        for inst, stats in zip(instances, stats_results):
+                            if stats is None:
+                                continue
+                            db.add(Metric(
+                                timestamp=now,
+                                metric_name="container_cpu_percent",
+                                value=stats["cpu"],
+                                unit="Percent",
+                                dimensions=json.dumps({"instance_id": inst.id}),
+                            ))
+                            db.add(Metric(
+                                timestamp=now,
+                                metric_name="container_memory_mb",
+                                value=stats["mem"],
+                                unit="Megabytes",
+                                dimensions=json.dumps({"instance_id": inst.id}),
+                            ))
                     except Exception:
                         pass
 
@@ -153,17 +169,27 @@ async def alarm_evaluator():
                 result = await db.execute(select(Alarm))
                 alarms = result.scalars().all()
 
-                for alarm in alarms:
-                    cutoff = datetime.utcnow() - timedelta(seconds=alarm.period_seconds)
-                    result = await db.execute(
+                if not alarms:
+                    await asyncio.sleep(60)
+                    continue
+
+                # Batch: compute averages per (metric_name, period) in fewer queries
+                metric_averages: dict[tuple[str, int], float | None] = {}
+                seen_keys = {(a.metric_name, a.period_seconds) for a in alarms}
+
+                for metric_name, period in seen_keys:
+                    cutoff = datetime.utcnow() - timedelta(seconds=period)
+                    row = (await db.execute(
                         text(
                             "SELECT AVG(value) FROM metrics "
                             "WHERE metric_name = :name AND timestamp > :cutoff"
                         ),
-                        {"name": alarm.metric_name, "cutoff": cutoff},
-                    )
-                    row = result.first()
-                    avg_value = row[0] if row and row[0] is not None else None
+                        {"name": metric_name, "cutoff": cutoff},
+                    )).first()
+                    metric_averages[(metric_name, period)] = row[0] if row and row[0] is not None else None
+
+                for alarm in alarms:
+                    avg_value = metric_averages.get((alarm.metric_name, alarm.period_seconds))
 
                     if avg_value is None:
                         alarm.state = "INSUFFICIENT_DATA"
@@ -188,15 +214,22 @@ async def alarm_evaluator():
 
 
 async def metrics_cleanup():
-    """Background task: delete old metrics every hour."""
+    """Background task: delete old metrics every hour in batches."""
     while True:
         try:
-            async with async_session() as db:
-                cutoff = datetime.utcnow() - timedelta(days=METRICS_RETENTION_DAYS)
-                await db.execute(
-                    delete(Metric).where(Metric.timestamp < cutoff)
-                )
-                await db.commit()
+            cutoff = datetime.utcnow() - timedelta(days=METRICS_RETENTION_DAYS)
+            while True:
+                async with async_session() as db:
+                    result = await db.execute(
+                        text(
+                            "DELETE FROM metrics WHERE id IN "
+                            "(SELECT id FROM metrics WHERE timestamp < :cutoff LIMIT 1000)"
+                        ),
+                        {"cutoff": cutoff},
+                    )
+                    await db.commit()
+                    if result.rowcount == 0:
+                        break
         except Exception:
             pass
 
@@ -276,19 +309,22 @@ async def get_latest_metrics(
     user: User = Depends(require_permission("cloudwatch:GetMetrics")),
     db: AsyncSession = Depends(get_db),
 ):
-    latest = {}
-    for name in ["cpu_percent", "memory_percent", "disk_percent"]:
-        result = await db.execute(
-            text(
-                "SELECT value FROM metrics "
-                "WHERE metric_name = :name AND dimensions = '{}' "
-                "ORDER BY timestamp DESC LIMIT 1"
-            ),
-            {"name": name},
+    # Single query: get latest value per metric using a correlated subquery
+    result = await db.execute(
+        text(
+            "SELECT m.metric_name, m.value FROM metrics m "
+            "INNER JOIN ("
+            "  SELECT metric_name, MAX(timestamp) AS max_ts FROM metrics "
+            "  WHERE metric_name IN ('cpu_percent', 'memory_percent', 'disk_percent') "
+            "    AND dimensions = '{}' "
+            "  GROUP BY metric_name"
+            ") latest ON m.metric_name = latest.metric_name AND m.timestamp = latest.max_ts "
+            "WHERE m.dimensions = '{}'"
         )
-        row = result.first()
-        latest[name] = round(row[0], 1) if row else None
-
+    )
+    latest = {}
+    for row in result.fetchall():
+        latest[row[0]] = round(row[1], 1)
     return latest
 
 
@@ -337,19 +373,22 @@ async def get_dashboard(
     user: User = Depends(require_permission("cloudwatch:GetMetrics")),
     db: AsyncSession = Depends(get_db),
 ):
-    # Latest system metrics
-    latest = {}
-    for name in ["cpu_percent", "memory_percent", "disk_percent", "memory_used_mb", "disk_used_gb"]:
-        result = await db.execute(
-            text(
-                "SELECT value FROM metrics "
-                "WHERE metric_name = :name AND dimensions = '{}' "
-                "ORDER BY timestamp DESC LIMIT 1"
-            ),
-            {"name": name},
+    # Single query for all latest system metrics
+    result = await db.execute(
+        text(
+            "SELECT m.metric_name, m.value FROM metrics m "
+            "INNER JOIN ("
+            "  SELECT metric_name, MAX(timestamp) AS max_ts FROM metrics "
+            "  WHERE metric_name IN ('cpu_percent', 'memory_percent', 'disk_percent', 'memory_used_mb', 'disk_used_gb') "
+            "    AND dimensions = '{}' "
+            "  GROUP BY metric_name"
+            ") latest ON m.metric_name = latest.metric_name AND m.timestamp = latest.max_ts "
+            "WHERE m.dimensions = '{}'"
         )
-        row = result.first()
-        latest[name] = round(row[0], 1) if row else None
+    )
+    latest = {}
+    for row in result.fetchall():
+        latest[row[0]] = round(row[1], 1)
 
     # Alarm states
     result = await db.execute(select(Alarm))

@@ -1,3 +1,4 @@
+import asyncio
 import io
 from datetime import timedelta
 from typing import Optional
@@ -88,11 +89,12 @@ async def create_bucket(
     if result.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Bucket name already taken")
 
-    # Create in MinIO
+    # Create in MinIO (non-blocking)
     try:
         client = get_minio()
-        if not client.bucket_exists(body.name):
-            client.make_bucket(body.name)
+        exists = await asyncio.to_thread(client.bucket_exists, body.name)
+        if not exists:
+            await asyncio.to_thread(client.make_bucket, body.name)
     except S3Error as e:
         raise HTTPException(status_code=400, detail=f"MinIO error: {e.message}")
 
@@ -122,13 +124,13 @@ async def delete_bucket(
 ):
     bucket = await _check_bucket_exists(bucket_name, db, user)
 
-    # Check if empty in MinIO
+    # Check if empty in MinIO (non-blocking)
     try:
         client = get_minio()
-        objects = list(client.list_objects(bucket_name, recursive=False))
+        objects = await asyncio.to_thread(lambda: list(client.list_objects(bucket_name, recursive=False)))
         if objects:
             raise HTTPException(status_code=400, detail="Bucket is not empty")
-        client.remove_bucket(bucket_name)
+        await asyncio.to_thread(client.remove_bucket, bucket_name)
     except S3Error as e:
         raise HTTPException(status_code=400, detail=f"MinIO error: {e.message}")
 
@@ -150,27 +152,27 @@ async def list_objects(
 
     try:
         client = get_minio()
-        results = []
 
-        objects = client.list_objects(
-            bucket_name, prefix=prefix or None, recursive=False
-        )
-        for obj in objects:
-            if obj.is_dir:
-                results.append({
-                    "key": obj.object_name,
-                    "is_prefix": True,
-                    "size": None,
-                    "last_modified": None,
-                })
-            else:
-                results.append({
-                    "key": obj.object_name,
-                    "is_prefix": False,
-                    "size": _format_size(obj.size),
-                    "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
-                })
-        return results
+        def _list():
+            items = []
+            for obj in client.list_objects(bucket_name, prefix=prefix or None, recursive=False):
+                if obj.is_dir:
+                    items.append({
+                        "key": obj.object_name,
+                        "is_prefix": True,
+                        "size": None,
+                        "last_modified": None,
+                    })
+                else:
+                    items.append({
+                        "key": obj.object_name,
+                        "is_prefix": False,
+                        "size": _format_size(obj.size),
+                        "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
+                    })
+            return items
+
+        return await asyncio.to_thread(_list)
     except S3Error as e:
         raise HTTPException(status_code=400, detail=f"MinIO error: {e.message}")
 
@@ -186,8 +188,8 @@ async def get_object(
 
     try:
         client = get_minio()
-        url = client.presigned_get_object(
-            bucket_name, key, expires=timedelta(hours=1)
+        url = await asyncio.to_thread(
+            client.presigned_get_object, bucket_name, key, expires=timedelta(hours=1)
         )
         url = _rewrite_presigned_url(url)
         return {"url": url, "key": key, "bucket": bucket_name}
@@ -208,12 +210,10 @@ async def upload_object(
     try:
         client = get_minio()
         data = await file.read()
-        client.put_object(
-            bucket_name,
-            key,
-            io.BytesIO(data),
-            length=len(data),
-            content_type=file.content_type or "application/octet-stream",
+        content_type = file.content_type or "application/octet-stream"
+        await asyncio.to_thread(
+            client.put_object,
+            bucket_name, key, io.BytesIO(data), len(data), content_type,
         )
         return {"detail": "Object uploaded", "key": key, "size": len(data)}
     except S3Error as e:
@@ -231,7 +231,7 @@ async def delete_object(
 
     try:
         client = get_minio()
-        client.remove_object(bucket_name, key)
+        await asyncio.to_thread(client.remove_object, bucket_name, key)
         return {"detail": "Object deleted"}
     except S3Error as e:
         raise HTTPException(status_code=400, detail=f"Delete failed: {e.message}")
@@ -249,8 +249,8 @@ async def presign_object(
 
     try:
         client = get_minio()
-        url = client.presigned_get_object(
-            bucket_name, key, expires=timedelta(seconds=body.expires_in)
+        url = await asyncio.to_thread(
+            client.presigned_get_object, bucket_name, key, expires=timedelta(seconds=body.expires_in)
         )
         url = _rewrite_presigned_url(url)
         return {"url": url, "expires_in": body.expires_in}

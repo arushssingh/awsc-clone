@@ -3,7 +3,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text,
-    UniqueConstraint, Index, event
+    UniqueConstraint, Index, event,
 )
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, relationship
@@ -11,7 +11,13 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker, relationship
 from config import DATABASE_URL
 
 
-engine = create_async_engine(DATABASE_URL, echo=False)
+engine = create_async_engine(
+    DATABASE_URL,
+    echo=False,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,
+)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -126,6 +132,10 @@ class Instance(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    __table_args__ = (
+        Index("idx_instance_owner_state", "owner_id", "state"),
+    )
+
 
 # ── VPC ──────────────────────────────────────────────────────────────────
 
@@ -172,6 +182,10 @@ class FunctionInvocation(Base):
     duration_ms = Column(Integer, nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("idx_invocation_fn_started", "function_id", "started_at"),
+    )
 
 
 # ── Route 53 ─────────────────────────────────────────────────────────────
@@ -246,6 +260,10 @@ class Deployment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    __table_args__ = (
+        Index("idx_deployment_owner", "owner_id"),
+    )
+
 
 # ── S3 ───────────────────────────────────────────────────────────────────
 
@@ -267,6 +285,10 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA synchronous=NORMAL")    # faster writes, still safe with WAL
+    cursor.execute("PRAGMA cache_size=-64000")      # 64MB page cache
+    cursor.execute("PRAGMA busy_timeout=5000")      # 5s wait on locks instead of immediate failure
+    cursor.execute("PRAGMA wal_autocheckpoint=1000") # checkpoint every 1000 pages
     cursor.close()
 
 

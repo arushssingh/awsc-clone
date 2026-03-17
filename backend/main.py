@@ -40,18 +40,23 @@ async def reconcile_instances():
         result = await db.execute(
             select(Instance).where(Instance.state.in_(["running", "pending", "stopping"]))
         )
-        for inst in result.scalars().all():
+        instances = result.scalars().all()
+
+        # Check all containers in parallel threads
+        async def _check_container(inst):
             if not inst.docker_container_id:
-                inst.state = "stopped"
-                continue
+                return inst, "stopped"
             try:
-                container = d.containers.get(inst.docker_container_id)
-                # "restarting" means the app is crash-looping — treat as stopped
-                if container.status == "running":
-                    pass  # keep existing state
-                else:
-                    inst.state = "stopped"
+                status = await asyncio.to_thread(
+                    lambda: d.containers.get(inst.docker_container_id).status
+                )
+                return inst, status if status == "running" else "stopped"
             except Exception:
+                return inst, "stopped"
+
+        results = await asyncio.gather(*[_check_container(inst) for inst in instances])
+        for inst, status in results:
+            if status != "running":
                 inst.state = "stopped"
         await db.commit()
 
@@ -68,35 +73,57 @@ async def reconcile_instances():
             remove_subdomain_route(inst.subdomain)
 
 
-# ── Rate limiting (fixed-window, auto-cleanup) ───────────────────────────
+# ── Rate limiting (sliding window counter — O(1) per request) ────────────
 
 _RATE_WINDOW = 60       # seconds
 _RATE_MAX = 120         # requests per window per IP
-_rate_buckets: dict[str, list[float]] = {}
+# Each entry: (prev_count, curr_count, window_start)
+_rate_buckets: dict[str, list] = {}
 _last_cleanup = 0.0
 
 
 def _check_rate_limit(ip: str) -> bool:
     global _last_cleanup
     now = time.monotonic()
-    cutoff = now - _RATE_WINDOW
 
-    # Cleanup stale IPs every 5 minutes to prevent memory leak
+    # Cleanup stale IPs every 5 minutes
     if now - _last_cleanup > 300:
-        stale = [k for k, v in _rate_buckets.items() if not v or v[-1] < cutoff]
+        cutoff = now - _RATE_WINDOW * 2
+        stale = [k for k, v in _rate_buckets.items() if v[2] < cutoff]
         for k in stale:
             del _rate_buckets[k]
         _last_cleanup = now
 
-    timestamps = _rate_buckets.get(ip, [])
-    timestamps = [t for t in timestamps if t > cutoff]
+    bucket = _rate_buckets.get(ip)
+    if bucket is None:
+        _rate_buckets[ip] = [0, 1, now]
+        return True
 
-    if len(timestamps) >= _RATE_MAX:
-        _rate_buckets[ip] = timestamps
+    prev_count, curr_count, window_start = bucket
+
+    # Slide windows
+    elapsed = now - window_start
+    if elapsed >= _RATE_WINDOW * 2:
+        # Both windows expired — reset
+        _rate_buckets[ip] = [0, 1, now]
+        return True
+    elif elapsed >= _RATE_WINDOW:
+        # Current window becomes previous, start new current
+        prev_count = curr_count
+        curr_count = 0
+        window_start = window_start + _RATE_WINDOW
+        elapsed = now - window_start
+
+    # Weighted estimate of requests in the sliding window
+    weight = 1.0 - (elapsed / _RATE_WINDOW)
+    estimated = prev_count * weight + curr_count
+
+    if estimated >= _RATE_MAX:
+        _rate_buckets[ip] = [prev_count, curr_count, window_start]
         return False
 
-    timestamps.append(now)
-    _rate_buckets[ip] = timestamps
+    curr_count += 1
+    _rate_buckets[ip] = [prev_count, curr_count, window_start]
     return True
 
 

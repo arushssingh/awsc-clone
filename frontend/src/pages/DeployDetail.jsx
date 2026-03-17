@@ -28,7 +28,7 @@ export default function DeployDetail() {
   const fetchLogs = () => api.get(`/deploy/projects/${id}/logs`).then(r => setLogs(r.data)).catch(() => {});
   const fetchFiles = () => {
     setFilesLoading(true);
-    api.get(`/deploy/projects/${id}/files`).then(r => setFiles(r.data)).catch(() => {}).finally(() => setFilesLoading(false));
+    api.get(`/deploy/projects/${id}/files`).then(r => setFiles(Array.isArray(r.data) ? r.data : [])).catch(() => setFiles([])).finally(() => setFilesLoading(false));
   };
 
   useEffect(() => {

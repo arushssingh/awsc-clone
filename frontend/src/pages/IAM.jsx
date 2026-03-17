@@ -28,10 +28,10 @@ export default function IAM() {
   const [selectedAssign, setSelectedAssign] = useState('');
 
   const fetchAll = () => {
-    api.get('/iam/users').then(r => setUsers(r.data)).catch(() => {});
-    api.get('/iam/roles').then(r => setRoles(r.data)).catch(() => {});
-    api.get('/iam/policies').then(r => setPolicies(r.data)).catch(() => {});
-    api.get('/iam/api-keys').then(r => setApiKeys(r.data)).catch(() => {});
+    api.get('/iam/users').then(r => setUsers(Array.isArray(r.data) ? r.data : [])).catch(() => setUsers([]));
+    api.get('/iam/roles').then(r => setRoles(Array.isArray(r.data) ? r.data : [])).catch(() => setRoles([]));
+    api.get('/iam/policies').then(r => setPolicies(Array.isArray(r.data) ? r.data : [])).catch(() => setPolicies([]));
+    api.get('/iam/api-keys').then(r => setApiKeys(Array.isArray(r.data) ? r.data : [])).catch(() => setApiKeys([]));
   };
 
   useEffect(() => { fetchAll(); }, []);

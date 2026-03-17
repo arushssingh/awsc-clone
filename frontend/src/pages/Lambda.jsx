@@ -15,8 +15,8 @@ export default function Lambda() {
 
   const fetchFunctions = () => {
     api.get('/lambda/functions')
-      .then(res => setFunctions(res.data))
-      .catch(() => {})
+      .then(res => setFunctions(Array.isArray(res.data) ? res.data : []))
+      .catch(() => setFunctions([]))
       .finally(() => setLoading(false));
   };
 

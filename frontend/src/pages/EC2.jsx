@@ -25,7 +25,7 @@ export default function EC2() {
   const [loading, setLoading] = useState(true);
 
   const fetchAll = () => {
-    api.get('/ec2/instances').then(r => setInstances(r.data)).catch(() => []).finally(() => setLoading(false));
+    api.get('/ec2/instances').then(r => setInstances(Array.isArray(r.data) ? r.data : [])).catch(() => setInstances([])).finally(() => setLoading(false));
   };
 
   // Launch modal

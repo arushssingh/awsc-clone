@@ -24,8 +24,8 @@ export default function Deploy() {
 
   const fetchDeployments = () => {
     api.get('/deploy/projects')
-      .then(res => setDeployments(res.data))
-      .catch(() => {})
+      .then(res => setDeployments(Array.isArray(res.data) ? res.data : []))
+      .catch(() => setDeployments([]))
       .finally(() => setLoading(false));
   };
 

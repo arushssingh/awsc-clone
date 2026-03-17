@@ -11,13 +11,7 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker, relationship
 from config import DATABASE_URL
 
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_size=5,
-    max_overflow=10,
-    pool_pre_ping=True,
-)
+engine = create_async_engine(DATABASE_URL, echo=False)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 

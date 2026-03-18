@@ -469,6 +469,12 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
                         pass
                 host_port = port_mappings.get(str(container_port)) or port_mappings.get(container_port) or _allocate_port()
                 old_container_id = inst.docker_container_id
+                env_vars = {}
+                if inst.environment:
+                    try:
+                        env_vars = json.loads(inst.environment)
+                    except json.JSONDecodeError:
+                        pass
 
             container_name = f"awsclone-{instance_id}"
             log(f"[deploy] Starting container on port {host_port} ...")
@@ -489,6 +495,7 @@ async def _build_and_replace(instance_id: str, project_dir: Path, info: dict):
                     detach=True,
                     name=container_name,
                     ports={f"{container_port}/tcp": ("0.0.0.0", host_port)},
+                    environment=env_vars,
                     labels={"awsclone": "true", "instance_id": instance_id},
                     mem_limit="512m",
                     restart_policy={"Name": "unless-stopped"},
@@ -812,6 +819,13 @@ def _instance_to_dict(instance: Instance) -> dict:
     if instance.subdomain and BASE_DOMAIN:
         website_url = f"https://{instance.subdomain}.{BASE_DOMAIN}"
 
+    environment = {}
+    if instance.environment:
+        try:
+            environment = json.loads(instance.environment)
+        except json.JSONDecodeError:
+            environment = {}
+
     return {
         "id": instance.id,
         "name": instance.name,
@@ -823,6 +837,7 @@ def _instance_to_dict(instance: Instance) -> dict:
         "vpc_id": instance.vpc_id,
         "private_ip": instance.private_ip,
         "port_mappings": port_mappings,
+        "environment": environment,
         "subdomain": instance.subdomain,
         "website_url": website_url,
         "cpu_limit": instance.cpu_limit,

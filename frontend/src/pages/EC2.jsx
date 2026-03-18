@@ -32,22 +32,27 @@ export default function EC2() {
   const [showLaunch, setShowLaunch] = useState(false);
   const [form, setForm] = useState({
     name: '', image: 'nginx:alpine', instance_type: 't2.micro',
-    port_mappings: '{"80": 0}', environment: '{}',
+    port_mappings: '{"80": 0}',
   });
+  const [envVars, setEnvVars] = useState([{ key: '', value: '' }]);
 
   const INPUT = "w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-blue-500";
 
   const handleDockerLaunch = async (e) => {
     e.preventDefault();
     try {
+      const environment = Object.fromEntries(
+        envVars.filter(v => v.key.trim()).map(v => [v.key.trim(), v.value])
+      );
       await api.post('/ec2/instances', {
         ...form,
         port_mappings: JSON.parse(form.port_mappings || '{}'),
-        environment: JSON.parse(form.environment || '{}'),
+        environment,
         vpc_id: null, command: null,
       });
       setShowLaunch(false);
-      setForm({ name: '', image: 'nginx:alpine', instance_type: 't2.micro', port_mappings: '{"80": 0}', environment: '{}' });
+      setForm({ name: '', image: 'nginx:alpine', instance_type: 't2.micro', port_mappings: '{"80": 0}' });
+      setEnvVars([{ key: '', value: '' }]);
       fetchAll();
       toast.success('Instance launched!');
     } catch (err) {
@@ -112,8 +117,31 @@ export default function EC2() {
                 <p className="text-xs text-gray-500 mt-1">Use 0 to auto-assign. E.g. {"{"}"80": 0{"}"} exposes port 80.</p>
               </div>
               <div>
-                <label className="block text-sm text-gray-300 mb-1">Environment (JSON)</label>
-                <input value={form.environment} onChange={e => setForm({...form, environment: e.target.value})} className={`${INPUT} font-mono`} placeholder='{"KEY": "value"}' />
+                <label className="block text-sm text-gray-300 mb-1">Environment Variables</label>
+                <div className="space-y-2">
+                  {envVars.map((v, i) => (
+                    <div key={i} className="flex gap-2 items-center">
+                      <input
+                        value={v.key}
+                        onChange={e => setEnvVars(envVars.map((ev, j) => j === i ? { ...ev, key: e.target.value } : ev))}
+                        className={`${INPUT} font-mono flex-1`}
+                        placeholder="KEY"
+                      />
+                      <input
+                        value={v.value}
+                        onChange={e => setEnvVars(envVars.map((ev, j) => j === i ? { ...ev, value: e.target.value } : ev))}
+                        className={`${INPUT} font-mono flex-1`}
+                        placeholder="value"
+                      />
+                      {envVars.length > 1 && (
+                        <button type="button" onClick={() => setEnvVars(envVars.filter((_, j) => j !== i))}
+                          className="text-red-400 hover:text-red-300 text-lg px-1">&times;</button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <button type="button" onClick={() => setEnvVars([...envVars, { key: '', value: '' }])}
+                  className="text-blue-400 hover:text-blue-300 text-xs mt-1">+ Add Variable</button>
               </div>
               <div className="bg-blue-900/20 border border-blue-700/40 rounded p-3 text-xs text-blue-300">
                 After launching, open the instance and use the <strong>Deploy</strong> tab to upload code from GitHub or a ZIP file.

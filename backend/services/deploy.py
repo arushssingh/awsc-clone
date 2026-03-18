@@ -113,7 +113,7 @@ def _detect_project(project_dir: Path) -> dict:
 
 # ── Dockerfile generation ──────────────────────────────────────────────
 
-def _generate_dockerfile(info: dict, project_dir: Path) -> Optional[str]:
+def _generate_dockerfile(info: dict, project_dir: Path, env_vars: dict | None = None) -> Optional[str]:
     t = info["type"]
 
     if t == "dockerfile":
@@ -124,12 +124,18 @@ def _generate_dockerfile(info: dict, project_dir: Path) -> Optional[str]:
 
     if t in ("vite", "cra", "vue", "angular", "svelte", "node-static"):
         out = info.get("output", "dist")
+        # Inject build-time ARG/ENV for each env var (needed for VITE_ prefix vars)
+        arg_lines = ""
+        if env_vars:
+            arg_lines = "\n".join(
+                f"ARG {k}\nENV {k}=${k}" for k in env_vars
+            ) + "\n"
         return f"""FROM node:20-alpine AS builder
 WORKDIR /app
 COPY package*.json ./
 RUN npm install
 COPY . .
-RUN npm run build
+{arg_lines}RUN npm run build
 
 FROM nginx:alpine
 COPY --from=builder /app/{out} /usr/share/nginx/html
@@ -218,41 +224,83 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
             await _save_status("building")
             log(f"[detect] Project type: {info['label']} ({info['type']})")
 
-            # Generate Dockerfile if needed
-            dockerfile_content = _generate_dockerfile(info, project_dir)
+            # Load env vars from database
+            env_dict: dict[str, str] = {}
+            async with async_session() as env_db:
+                env_result = await env_db.execute(
+                    select(Deployment).where(Deployment.id == deploy_id)
+                )
+                env_dep = env_result.scalar_one_or_none()
+                if env_dep and env_dep.env_vars:
+                    try:
+                        parsed = json.loads(env_dep.env_vars)
+                        if isinstance(parsed, list):
+                            env_dict = {item["key"]: item["value"] for item in parsed if item.get("key")}
+                        elif isinstance(parsed, dict):
+                            env_dict = parsed
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+            if env_dict:
+                log(f"[env] Loaded {len(env_dict)} environment variable(s)")
+
+            # Determine container port
+            is_static = info["type"] in ("static", "vite", "cra", "vue", "angular", "svelte", "node-static")
+            container_port = 80 if is_static else info.get("port", 3000)
+
+            # Split env vars: build-time (VITE_, REACT_APP_, NEXT_PUBLIC_) vs runtime-only
+            _BUILD_PREFIXES = ("VITE_", "REACT_APP_", "NEXT_PUBLIC_")
+            build_env = {k: v for k, v in env_dict.items() if k.startswith(_BUILD_PREFIXES)} if env_dict else {}
+            runtime_only_env = {k: v for k, v in env_dict.items() if not k.startswith(_BUILD_PREFIXES)} if env_dict else {}
+
+            # Generate Dockerfile if needed (pass only build-time vars for ARG injection)
+            dockerfile_content = _generate_dockerfile(
+                info, project_dir, env_vars=build_env if is_static and build_env else None
+            )
             if dockerfile_content is not None:
                 (project_dir / "Dockerfile").write_text(dockerfile_content)
                 log("[build] Generated Dockerfile")
             else:
                 log("[build] Using existing Dockerfile")
 
-            # Determine container port
-            is_static = info["type"] in ("static", "vite", "cra", "vue", "angular", "svelte", "node-static")
-            container_port = 80 if is_static else info.get("port", 3000)
-
             image_tag = f"awsclone-deploy-{deploy_id}"
             log(f"[build] Building image: {image_tag} ...")
 
-            # Build image in thread (blocking Docker SDK call)
+            # Pass only build-time prefixed vars as buildargs for static site builders
+            build_args = build_env if is_static and build_env else None
+
             def _docker_build():
                 client = _get_docker()
-                image, build_logs = client.images.build(
-                    path=str(project_dir),
-                    tag=image_tag,
-                    rm=True,
-                    forcerm=True,
-                )
+                build_kwargs = {
+                    "path": str(project_dir),
+                    "tag": image_tag,
+                    "rm": True,
+                    "forcerm": True,
+                }
+                if build_args:
+                    build_kwargs["buildargs"] = build_args
+                image, build_logs = client.images.build(**build_kwargs)
                 return image, build_logs
+
+            # Collect env var values to redact from build logs
+            _redact_values = set(env_dict.values()) if env_dict else set()
+            _redact_values.discard("")
+
+            def _redact(text: str) -> str:
+                for secret in _redact_values:
+                    if len(secret) > 4 and secret in text:
+                        text = text.replace(secret, "***REDACTED***")
+                return text
 
             try:
                 image, build_logs = await asyncio.to_thread(_docker_build)
                 for chunk in build_logs:
                     if "stream" in chunk:
-                        line = chunk["stream"].strip()
+                        line = _redact(chunk["stream"].strip())
                         if line:
                             log(f"  {line}")
                     if "error" in chunk:
-                        log(f"  ERROR: {chunk['error']}")
+                        log(f"  ERROR: {_redact(chunk['error'])}")
                         raise Exception(chunk["error"])
             except docker.errors.BuildError as e:
                 log(f"[build] FAILED: {e}")
@@ -276,6 +324,12 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
 
             log(f"[deploy] Starting container on port {host_port} ...")
 
+            # Runtime env vars: server-side gets all vars, static gets only non-build vars
+            if is_static:
+                runtime_env = runtime_only_env if runtime_only_env else None
+            else:
+                runtime_env = env_dict if env_dict else None
+
             def _docker_run():
                 client = _get_docker()
                 # Remove old container if exists
@@ -285,16 +339,19 @@ async def _build_and_deploy(deploy_id: str, project_dir: Path, info: dict):
                 except docker.errors.NotFound:
                     pass
 
-                container = client.containers.run(
-                    image_tag,
-                    detach=True,
-                    name=container_name,
-                    ports={f"{container_port}/tcp": ("0.0.0.0", host_port)},
-                    labels={"awsclone": "true", "deploy_id": deploy_id},
-                    mem_limit="256m",
-                    restart_policy={"Name": "unless-stopped"},
-                    network="awsclone-internal",
-                )
+                run_kwargs = {
+                    "detach": True,
+                    "name": container_name,
+                    "ports": {f"{container_port}/tcp": ("0.0.0.0", host_port)},
+                    "labels": {"awsclone": "true", "deploy_id": deploy_id},
+                    "mem_limit": "256m",
+                    "restart_policy": {"Name": "unless-stopped"},
+                    "network": "awsclone-internal",
+                }
+                if runtime_env:
+                    run_kwargs["environment"] = runtime_env
+
+                container = client.containers.run(image_tag, **run_kwargs)
                 container.reload()
                 return container
 
@@ -901,6 +958,14 @@ def _deploy_to_dict(dep: Deployment) -> dict:
 
     tunnel = _deploy_tunnels.get(dep.id)
 
+    env_count = 0
+    if dep.env_vars:
+        try:
+            parsed = json.loads(dep.env_vars)
+            env_count = len(parsed) if isinstance(parsed, list) else len(parsed.keys())
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     return {
         "id": dep.id,
         "name": dep.name,
@@ -914,6 +979,7 @@ def _deploy_to_dict(dep: Deployment) -> dict:
         "github_repo": dep.github_repo,
         "github_branch": dep.github_branch,
         "github_webhook_id": dep.github_webhook_id,
+        "env_vars_count": env_count,
         "created_at": dep.created_at.isoformat() if dep.created_at else None,
         "updated_at": dep.updated_at.isoformat() if dep.updated_at else None,
     }

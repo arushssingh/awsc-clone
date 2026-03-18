@@ -12,6 +12,21 @@ const STATUS_COLORS = {
   stopped: 'bg-gray-500/20 text-gray-400',
 };
 
+const KEY_TYPE_OPTIONS = [
+  { value: 'custom', label: 'Custom' },
+  { value: 'supabase_url', label: 'Supabase URL', defaultKey: 'VITE_SUPABASE_URL' },
+  { value: 'supabase_anon_key', label: 'Supabase Anon Key', defaultKey: 'VITE_SUPABASE_ANON_KEY' },
+  { value: 'ai_api_key', label: 'AI API Key', defaultKey: '' },
+];
+
+const TAB_LABELS = {
+  'overview': 'Overview',
+  'env-vars': 'Env Vars',
+  'files': 'Files',
+  'build-log': 'Build Log',
+  'runtime-log': 'Runtime Log',
+};
+
 export default function DeployDetail() {
   const { id } = useParams();
   const toast = useToast();
@@ -24,17 +39,40 @@ export default function DeployDetail() {
   const [filesLoading, setFilesLoading] = useState(false);
   const logEndRef = useRef(null);
 
+  // Env vars state
+  const [envVars, setEnvVars] = useState([]);
+  const [envLoading, setEnvLoading] = useState(false);
+  const [envSaving, setEnvSaving] = useState(false);
+  const [validating, setValidating] = useState({});
+  const [validationResults, setValidationResults] = useState({});
+  const [showValues, setShowValues] = useState({});
+
   const fetchDep = () => api.get(`/deploy/projects/${id}`).then(r => setDep(r.data)).catch(() => {});
   const fetchLogs = () => api.get(`/deploy/projects/${id}/logs`).then(r => setLogs(r.data)).catch(() => {});
   const fetchFiles = () => {
     setFilesLoading(true);
     api.get(`/deploy/projects/${id}/files`).then(r => setFiles(Array.isArray(r.data) ? r.data : [])).catch(() => setFiles([])).finally(() => setFilesLoading(false));
   };
+  const fetchEnvVars = () => {
+    setEnvLoading(true);
+    api.get(`/deploy/projects/${id}/env`)
+      .then(r => {
+        const vars = (r.data.env_vars || []).map(ev => ({
+          ...ev,
+          value: '',
+          placeholder: ev.has_value ? ev.display_value : '',
+        }));
+        setEnvVars(vars);
+      })
+      .catch(() => setEnvVars([]))
+      .finally(() => setEnvLoading(false));
+  };
 
   useEffect(() => {
     fetchDep();
     fetchLogs();
     fetchFiles();
+    fetchEnvVars();
     const interval = setInterval(() => { fetchDep(); fetchLogs(); }, 4000);
     return () => clearInterval(interval);
   }, [id]);
@@ -80,6 +118,101 @@ export default function DeployDetail() {
     } finally {
       setActionLoading('');
     }
+  };
+
+  // ── Env var handlers (immutable updates) ──
+
+  const addEnvVar = () => {
+    setEnvVars(prev => [...prev, { key: '', value: '', key_type: 'custom' }]);
+  };
+
+  const updateEnvVar = (index, field, newValue) => {
+    setEnvVars(prev => prev.map((item, i) => {
+      if (i !== index) return item;
+      const updated = { ...item, [field]: newValue };
+      // Auto-fill key name when selecting a preset type
+      if (field === 'key_type') {
+        const preset = KEY_TYPE_OPTIONS.find(o => o.value === newValue);
+        if (preset && preset.defaultKey) {
+          return { ...updated, key: preset.defaultKey };
+        }
+      }
+      return updated;
+    }));
+    // Clear validation result when value changes
+    if (field === 'value' || field === 'key') {
+      setValidationResults(prev => {
+        const next = { ...prev };
+        delete next[index];
+        return next;
+      });
+    }
+  };
+
+  const removeEnvVar = (index) => {
+    setEnvVars(prev => prev.filter((_, i) => i !== index));
+    setValidationResults(prev => {
+      const next = { ...prev };
+      delete next[index];
+      return next;
+    });
+  };
+
+  const saveEnvVars = async () => {
+    setEnvSaving(true);
+    try {
+      await api.put(`/deploy/projects/${id}/env`, {
+        env_vars: envVars.map(ev => ({
+          key: ev.key.trim(),
+          value: ev.value,
+          key_type: ev.key_type,
+        })),
+      });
+      toast.success('Environment variables saved. Redeploy to apply changes.');
+      fetchEnvVars();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to save');
+    } finally {
+      setEnvSaving(false);
+    }
+  };
+
+  const validateEnvVar = async (index) => {
+    const ev = envVars[index];
+    if (!ev.value && !ev.has_value) {
+      toast.error('Enter a value first');
+      return;
+    }
+    setValidating(prev => ({ ...prev, [index]: true }));
+    try {
+      const payload = {
+        key: ev.key,
+        value: ev.value,
+        key_type: ev.key_type,
+      };
+      // For anon key validation, pass the Supabase URL from the current session
+      if (ev.key_type === 'supabase_anon_key') {
+        const urlVar = envVars.find(v => v.key === 'VITE_SUPABASE_URL');
+        if (urlVar && urlVar.value) {
+          payload.supabase_url = urlVar.value;
+        }
+      }
+      const res = await api.post(`/deploy/projects/${id}/env/validate`, payload);
+      setValidationResults(prev => ({ ...prev, [index]: res.data }));
+      if (res.data.valid) {
+        toast.success(res.data.message);
+      } else {
+        toast.error(res.data.message);
+      }
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Validation failed');
+    } finally {
+      setValidating(prev => ({ ...prev, [index]: false }));
+    }
+  };
+
+  const toggleShowValue = (index) => {
+    setShowValues(prev => ({ ...prev, [index]: !prev[index] }));
   };
 
   if (!dep) return <div className="text-gray-500 text-center py-8">Loading...</div>;
@@ -180,10 +313,13 @@ export default function DeployDetail() {
 
       {/* Tabs */}
       <div className="flex gap-1 mb-4 border-b border-gray-700">
-        {['overview', 'files', 'build-log', 'runtime-log'].map(t => (
-          <button key={t} onClick={() => { setTab(t); if (t === 'files') fetchFiles(); }}
+        {Object.keys(TAB_LABELS).map(t => (
+          <button key={t} onClick={() => { setTab(t); if (t === 'files') fetchFiles(); if (t === 'env-vars') fetchEnvVars(); }}
             className={`px-4 py-2 text-sm transition-colors ${tab === t ? 'text-blue-400 border-b-2 border-blue-400' : 'text-gray-400 hover:text-white'}`}>
-            {t === 'overview' ? 'Overview' : t === 'files' ? 'Files' : t === 'build-log' ? 'Build Log' : 'Runtime Log'}
+            {TAB_LABELS[t]}
+            {t === 'env-vars' && dep.env_vars_count > 0 && (
+              <span className="ml-1.5 text-xs bg-gray-700 text-gray-300 px-1.5 py-0.5 rounded-full">{dep.env_vars_count}</span>
+            )}
           </button>
         ))}
       </div>
@@ -217,11 +353,11 @@ export default function DeployDetail() {
           <div className="grid grid-cols-2 gap-4">
           {[
             ['Status', dep.status],
-            ['Project Type', dep.project_label || dep.project_type || '—'],
-            ['Port', dep.port || '—'],
+            ['Project Type', dep.project_label || dep.project_type || '\u2014'],
+            ['Port', dep.port || '\u2014'],
             ['Created', new Date(dep.created_at).toLocaleString()],
             ['Updated', new Date(dep.updated_at).toLocaleString()],
-            ['Container ID', dep.docker_container_id ? dep.docker_container_id.slice(0, 12) : '—'],
+            ['Env Vars', dep.env_vars_count || '0'],
           ].map(([label, value]) => (
             <div key={label} className="bg-gray-800 rounded-lg p-4">
               <p className="text-xs text-gray-500 mb-1">{label}</p>
@@ -230,6 +366,147 @@ export default function DeployDetail() {
           ))}
           </div>
         </>
+      )}
+
+      {/* Env Vars Tab */}
+      {tab === 'env-vars' && (
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-medium text-white">Environment Variables</h3>
+              <p className="text-xs text-gray-500 mt-0.5">Set API keys, URLs, and secrets. Redeploy after saving to apply.</p>
+            </div>
+            <button onClick={addEnvVar}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded text-sm transition-colors">
+              Add Variable
+            </button>
+          </div>
+
+          {envLoading ? (
+            <div className="text-gray-500 text-center py-8 text-sm">Loading...</div>
+          ) : envVars.length === 0 ? (
+            <div className="bg-gray-800 rounded-lg p-8 text-center">
+              <p className="text-gray-400 mb-2">No environment variables</p>
+              <p className="text-gray-500 text-sm mb-4">Add variables like API keys and Supabase credentials</p>
+              <button onClick={addEnvVar}
+                className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm">
+                Add First Variable
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="space-y-3">
+                {envVars.map((ev, idx) => {
+                  const vResult = validationResults[idx];
+                  const isValidating = validating[idx];
+                  const isPresetKey = ev.key_type !== 'custom' && KEY_TYPE_OPTIONS.find(o => o.value === ev.key_type)?.defaultKey;
+
+                  return (
+                    <div key={idx} className="bg-gray-800 rounded-lg p-4 space-y-3">
+                      <div className="flex items-start gap-3">
+                        {/* Key Type */}
+                        <div className="w-44 shrink-0">
+                          <label className="block text-xs text-gray-500 mb-1">Type</label>
+                          <select
+                            value={ev.key_type}
+                            onChange={e => updateEnvVar(idx, 'key_type', e.target.value)}
+                            className="w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-white text-sm focus:outline-none focus:border-blue-500"
+                          >
+                            {KEY_TYPE_OPTIONS.map(opt => (
+                              <option key={opt.value} value={opt.value}>{opt.label}</option>
+                            ))}
+                          </select>
+                        </div>
+
+                        {/* Key Name */}
+                        <div className="flex-1 min-w-0">
+                          <label className="block text-xs text-gray-500 mb-1">Key</label>
+                          <input
+                            value={ev.key}
+                            onChange={e => updateEnvVar(idx, 'key', e.target.value)}
+                            readOnly={!!isPresetKey}
+                            placeholder="VARIABLE_NAME"
+                            className={`w-full px-2 py-1.5 bg-gray-700 border border-gray-600 rounded text-white text-sm font-mono focus:outline-none focus:border-blue-500 ${isPresetKey ? 'text-gray-400 cursor-not-allowed' : ''}`}
+                          />
+                        </div>
+
+                        {/* Value */}
+                        <div className="flex-1 min-w-0">
+                          <label className="block text-xs text-gray-500 mb-1">Value</label>
+                          <div className="relative">
+                            <input
+                              type={showValues[idx] ? 'text' : 'password'}
+                              value={ev.value}
+                              onChange={e => updateEnvVar(idx, 'value', e.target.value)}
+                              placeholder={ev.placeholder || 'Enter value...'}
+                              className="w-full px-2 py-1.5 pr-8 bg-gray-700 border border-gray-600 rounded text-white text-sm font-mono focus:outline-none focus:border-blue-500"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => toggleShowValue(idx)}
+                              className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white text-xs"
+                            >
+                              {showValues[idx] ? 'Hide' : 'Show'}
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Actions */}
+                        <div className="flex items-end gap-1.5 shrink-0 pb-0.5">
+                          {ev.key_type !== 'custom' && (
+                            <button
+                              onClick={() => validateEnvVar(idx)}
+                              disabled={isValidating || !ev.value}
+                              className="px-2.5 py-1.5 bg-purple-600 hover:bg-purple-700 text-white rounded text-xs disabled:opacity-50 transition-colors"
+                            >
+                              {isValidating ? 'Testing...' : 'Validate'}
+                            </button>
+                          )}
+                          <button
+                            onClick={() => removeEnvVar(idx)}
+                            className="px-2 py-1.5 bg-red-900/50 hover:bg-red-800/50 text-red-400 rounded text-xs transition-colors"
+                          >
+                            Remove
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Validation Result */}
+                      {vResult && (
+                        <div className={`flex items-center gap-2 text-xs px-3 py-2 rounded ${
+                          vResult.valid
+                            ? 'bg-green-900/30 text-green-400 border border-green-800/50'
+                            : 'bg-red-900/30 text-red-400 border border-red-800/50'
+                        }`}>
+                          <span>{vResult.valid ? '\u2713' : '\u2717'}</span>
+                          <span>{vResult.message}</span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Save Button */}
+              <div className="flex items-center justify-between pt-2">
+                <p className="text-xs text-gray-500">
+                  Changes require a redeploy to take effect.
+                  {dep.project_label && (dep.project_label.includes('Vite') || dep.project_label.includes('React') || dep.project_label.includes('Vue'))
+                    ? ' VITE_ prefixed vars are injected at build time.'
+                    : ' Vars are injected as runtime environment variables.'
+                  }
+                </p>
+                <button
+                  onClick={saveEnvVars}
+                  disabled={envSaving}
+                  className="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded text-sm disabled:opacity-50 transition-colors"
+                >
+                  {envSaving ? 'Saving...' : 'Save Variables'}
+                </button>
+              </div>
+            </>
+          )}
+        </div>
       )}
 
       {/* Files Tab */}
